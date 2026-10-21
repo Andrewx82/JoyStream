@@ -2,10 +2,12 @@
 
 #include <string>
 #include <vector>
+#include <map>
 #include <functional>
 
 struct mpv_handle;
 struct mpv_render_context;
+struct mpv_stream_cb_info;
 struct SDL_Texture;
 
 namespace Stremio {
@@ -60,9 +62,12 @@ public:
     void setNetworkTimeout(int seconds);
 
 private:
+    static int streamCbOpen(void* user_data, char* uri, struct mpv_stream_cb_info* info);
+
     mpv_handle* m_mpv = nullptr;
     mpv_render_context* m_mpvRenderCtx = nullptr;
     PlaybackState m_state;
+    std::map<std::string, std::string> m_currentHeaders;
     std::string m_lastMpvLogMessage;
     bool m_needsRedraw = false;
 };

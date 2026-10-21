@@ -1,10 +1,46 @@
 #include "stremio/player.hpp"
+#include "stremio/curl_stream.hpp"
 #include <iostream>
 #include <mpv/client.h>
 #include <mpv/render.h>
+#include <mpv/stream_cb.h>
 #include <SDL2/SDL.h>
 
 namespace Stremio {
+
+int VideoPlayer::streamCbOpen(void* user_data, char* uri, mpv_stream_cb_info* info) {
+    auto* player = static_cast<VideoPlayer*>(user_data);
+    std::string urlStr = uri ? uri : "";
+
+    std::string realUrl = urlStr;
+    if (urlStr.rfind("jshttp://", 0) == 0) {
+        realUrl = "http://" + urlStr.substr(9);
+    } else if (urlStr.rfind("jshttps://", 0) == 0) {
+        realUrl = "https://" + urlStr.substr(10);
+    }
+
+    std::cout << "[VideoPlayer] streamCbOpen opening URL via CurlStream: " << realUrl << std::endl;
+
+    auto* stream = new CurlStream(realUrl, player ? player->m_currentHeaders : std::map<std::string, std::string>{});
+    if (!stream->open()) {
+        std::cerr << "[VideoPlayer] CurlStream failed: " << stream->getLastError() << std::endl;
+        if (player) {
+            player->m_lastMpvLogMessage = "CurlStream: " + stream->getLastError();
+        }
+        delete stream;
+        return -13; // MPV_ERROR_LOADING_FAILED
+    }
+
+    info->cookie = stream;
+    info->read_fn = &CurlStream::mpvRead;
+    info->seek_fn = &CurlStream::mpvSeek;
+    info->size_fn = &CurlStream::mpvSize;
+    info->close_fn = &CurlStream::mpvClose;
+    info->cancel_fn = &CurlStream::mpvCancel;
+
+    std::cout << "[VideoPlayer] CurlStream initialized successfully for: " << realUrl << std::endl;
+    return 0;
+}
 
 VideoPlayer::VideoPlayer() = default;
 
@@ -34,24 +70,30 @@ bool VideoPlayer::initialize() {
     // Video Output: Use libmpv rendering backend for mpv_render_context
     mpv_set_option_string(m_mpv, "vo", "libmpv");
 
+    // Software decoding: Required for MPV_RENDER_API_TYPE_SW software texture surface.
+    // Multi-threaded decoding on the 4 CPU cores provides fast and stable 720p/1080p playback.
+    mpv_set_option_string(m_mpv, "hwdec", "no");
+    mpv_set_option_string(m_mpv, "vd-lavc-threads", "4");
+
 #ifdef __SWITCH__
-    // Hardware accelerated video decoding on Tegra X1 & Horizon native audio
-    mpv_set_option_string(m_mpv, "hwdec", "auto");
     mpv_set_option_string(m_mpv, "ao", "hos,sdl");
 #else
-    mpv_set_option_string(m_mpv, "hwdec", "auto");
     mpv_set_option_string(m_mpv, "ao", "pulse,alsa,sdl");
 #endif
 
     // Cache and network tuning for Switch Wi-Fi & streaming
     mpv_set_option_string(m_mpv, "cache", "yes");
-    mpv_set_option_string(m_mpv, "demuxer-max-bytes", "128M");
-    mpv_set_option_string(m_mpv, "demuxer-max-back-bytes", "32M");
+    mpv_set_option_string(m_mpv, "demuxer-max-bytes", "64M");
+    mpv_set_option_string(m_mpv, "demuxer-max-back-bytes", "16M");
     mpv_set_option_string(m_mpv, "network-timeout", "20");
     mpv_set_option_string(m_mpv, "ytdl", "no");
 
+    // Register CurlStream custom protocol handlers for rock-solid Switch HTTPS streaming
+    mpv_stream_cb_add_ro(m_mpv, "jshttp", this, &VideoPlayer::streamCbOpen);
+    mpv_stream_cb_add_ro(m_mpv, "jshttps", this, &VideoPlayer::streamCbOpen);
+
     // Request MPV log messages to capture stream loading errors
-    mpv_request_log_messages(m_mpv, "info");
+    mpv_request_log_messages(m_mpv, "warn");
 
     int res = mpv_initialize(m_mpv);
     if (res < 0) {
@@ -117,7 +159,19 @@ bool VideoPlayer::play(const std::string& url, const std::string& title, const s
     m_lastMpvLogMessage.clear();
     m_needsRedraw = true;
 
-    // Set custom headers if provided
+    // Save headers for CurlStream and MPV HTTP
+    m_currentHeaders.clear();
+    for (const auto& h : headers) {
+        auto colon = h.find(':');
+        if (colon != std::string::npos) {
+            std::string k = h.substr(0, colon);
+            std::string v = h.substr(colon + 1);
+            while (!v.empty() && (v.front() == ' ' || v.front() == '\t')) v.erase(v.begin());
+            while (!v.empty() && (v.back() == ' ' || v.back() == '\t' || v.back() == '\r' || v.back() == '\n')) v.pop_back();
+            m_currentHeaders[k] = v;
+        }
+    }
+
     if (!headers.empty()) {
         std::string headerList;
         for (const auto& h : headers) {
@@ -126,7 +180,17 @@ bool VideoPlayer::play(const std::string& url, const std::string& title, const s
         mpv_set_option_string(m_mpv, "http-header-fields", headerList.c_str());
     }
 
-    const char* cmd[] = {"loadfile", url.c_str(), "replace", nullptr};
+    // For HTTP/HTTPS streams, route through our CurlStream protocol handlers (jshttp / jshttps)
+    // which bypasses Horizon SSL certstore issues and follows all redirects natively via libcurl.
+    std::string playUrl = url;
+    if (url.rfind("http://", 0) == 0) {
+        playUrl = "jshttp://" + url.substr(7);
+    } else if (url.rfind("https://", 0) == 0) {
+        playUrl = "jshttps://" + url.substr(8);
+    }
+
+    std::cout << "[Playback] Dispatching to MPV: " << playUrl << std::endl;
+    const char* cmd[] = {"loadfile", playUrl.c_str(), "replace", nullptr};
     int res = mpv_command(m_mpv, cmd);
     if (res < 0) {
         m_state.errorMessage = mpv_error_string(res);
@@ -255,12 +319,14 @@ void VideoPlayer::update() {
             case MPV_EVENT_LOG_MESSAGE: {
                 auto* msg = static_cast<mpv_event_log_message*>(event->data);
                 if (msg) {
-                    if (msg->log_level >= MPV_LOG_LEVEL_WARN || std::string(msg->prefix) == "cplayer" || std::string(msg->prefix) == "ffmpeg" || std::string(msg->prefix) == "tls") {
+                    // Lower numeric log level in mpv means higher severity:
+                    // MPV_LOG_LEVEL_FATAL = 10, ERROR = 20, WARN = 30
+                    if (msg->log_level <= MPV_LOG_LEVEL_WARN) {
                         std::cout << "[mpv " << msg->prefix << "] " << msg->text;
                         std::string t = msg->text;
                         while (!t.empty() && (t.back() == '\n' || t.back() == '\r')) t.pop_back();
-                        if (!t.empty() && t.find("Exiting") == std::string::npos && t.find("cplayer") == std::string::npos) {
-                            m_lastMpvLogMessage = t;
+                        if (!t.empty() && t.find("Exiting") == std::string::npos) {
+                            m_lastMpvLogMessage = std::string(msg->prefix) + ": " + t;
                         }
                     }
                 }

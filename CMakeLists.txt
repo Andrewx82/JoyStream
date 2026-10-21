@@ -26,6 +26,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch" OR NINTENDO_SWITCH)
         src/stremio_client.cpp
         src/addon_manager.cpp
         src/stream_filter.cpp
+        src/curl_stream.cpp
         src/player.cpp
         src/ui_engine.cpp
     )
@@ -63,6 +64,7 @@ else()
         src/stremio_client.cpp
         src/addon_manager.cpp
         src/stream_filter.cpp
+        src/curl_stream.cpp
     )
     target_link_libraries(test_stremio_core PRIVATE CURL::libcurl pthread)
 
@@ -72,6 +74,7 @@ else()
         src/stremio_client.cpp
         src/addon_manager.cpp
         src/stream_filter.cpp
+        src/curl_stream.cpp
         src/player.cpp
         src/ui_engine.cpp
     )

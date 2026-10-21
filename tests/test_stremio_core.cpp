@@ -2,6 +2,7 @@
 #include "stremio/addon_manager.hpp"
 #include "stremio/http_client.hpp"
 #include "stremio/stream_filter.hpp"
+#include "stremio/curl_stream.hpp"
 #include <iostream>
 #include <cassert>
 #include <cmath>
@@ -173,6 +174,30 @@ void runTests() {
     assert(allFiltered.size() == mockStreams.size());
 
     std::cout << "  PASS: Stream filter presets and custom regex validated successfully." << std::endl;
+
+    // Test 8: CurlStream Network & Range Streaming
+    std::cout << "\n[TEST 8] CurlStream Protocol & Range Playback Engine..." << std::endl;
+    CurlStream stream("https://torrentio.strem.fun/videos/failed_access_v3.mp4");
+    bool openOk = stream.open();
+    assert(openOk);
+    assert(stream.getSize() == 149660);
+    std::cout << "  Stream connected. Size: " << stream.getSize() << " bytes." << std::endl;
+
+    // Read initial 1024 bytes (container header)
+    char buffer[1024];
+    int64_t bytesRead = stream.read(buffer, sizeof(buffer));
+    assert(bytesRead == 1024);
+    std::cout << "  Read " << bytesRead << " bytes from start." << std::endl;
+
+    // Test seeking forward to middle of file
+    int64_t seekPos = stream.seek(50000);
+    assert(seekPos == 50000);
+    char bufMid[512];
+    int64_t bytesMid = stream.read(bufMid, sizeof(bufMid));
+    assert(bytesMid == 512);
+    std::cout << "  Seeked to 50000 and read " << bytesMid << " bytes." << std::endl;
+
+    std::cout << "  PASS: CurlStream opened, parsed size, read bytes, and seeked successfully." << std::endl;
 
     std::cout << "\n========================================" << std::endl;
     std::cout << "  ALL STREMIO TESTS PASSED SUCCESSFULLY!" << std::endl;
