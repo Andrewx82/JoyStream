@@ -21,10 +21,8 @@ bool VideoPlayer::initialize() {
 
     // Configure video player options
 #ifdef __SWITCH__
-    // Hardware acceleration on Tegra X1 (NVDEC)
     mpv_set_option_string(m_mpv, "hwdec", "auto");
     mpv_set_option_string(m_mpv, "vo", "gpu");
-    mpv_set_option_string(m_mpv, "gpu-context", "auto");
 #else
     mpv_set_option_string(m_mpv, "hwdec", "auto");
 #endif

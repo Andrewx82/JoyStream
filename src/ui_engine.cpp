@@ -42,47 +42,62 @@ UiEngine::~UiEngine() {
 }
 
 bool UiEngine::initialize() {
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_JOYSTICK | SDL_INIT_GAMECONTROLLER) < 0) {
-        std::cerr << "SDL_Init failed: " << SDL_GetError() << std::endl;
+    std::cout << "[SDL] Initializing SDL2..." << std::endl;
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_JOYSTICK) < 0) {
+        std::cerr << "[SDL] SDL_Init failed: " << SDL_GetError() << std::endl;
         return false;
     }
 
     if (TTF_Init() < 0) {
-        std::cerr << "TTF_Init failed: " << TTF_GetError() << std::endl;
+        std::cerr << "[TTF] TTF_Init failed: " << TTF_GetError() << std::endl;
         return false;
     }
 
-    // Initialize Switch controllers
-    for (int i = 0; i < SDL_NumJoysticks(); ++i) {
-        if (SDL_IsGameController(i)) {
-            SDL_GameControllerOpen(i);
+    // Open Joysticks on Switch
+    int numJoysticks = SDL_NumJoysticks();
+    std::cout << "[SDL] Found " << numJoysticks << " joystick(s)." << std::endl;
+    for (int i = 0; i < numJoysticks && i < 2; ++i) {
+        if (SDL_JoystickOpen(i) == nullptr) {
+            std::cerr << "[SDL] Warning: Could not open joystick " << i << ": " << SDL_GetError() << std::endl;
+        } else {
+            std::cout << "[SDL] Opened joystick " << i << std::endl;
         }
     }
 
-    // Switch handheld resolution is 1280x720
-    m_window = SDL_CreateWindow(
-        "JoyStream",
-        SDL_WINDOWPOS_CENTERED,
-        SDL_WINDOWPOS_CENTERED,
-        1280, 720,
-        SDL_WINDOW_SHOWN
-    );
+    // Window Creation
+    std::cout << "[SDL] Creating 1280x720 window..." << std::endl;
+#ifdef __SWITCH__
+    m_window = SDL_CreateWindow("JoyStream", 0, 0, 1280, 720, 0);
+#else
+    m_window = SDL_CreateWindow("JoyStream", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1280, 720, SDL_WINDOW_SHOWN);
+#endif
 
     if (!m_window) {
-        std::cerr << "Window creation failed: " << SDL_GetError() << std::endl;
+        std::cerr << "[SDL] Window creation failed: " << SDL_GetError() << std::endl;
         return false;
     }
 
     m_renderer = SDL_CreateRenderer(m_window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
     if (!m_renderer) {
+        std::cout << "[SDL] Hardware renderer not available, falling back to software renderer..." << std::endl;
         m_renderer = SDL_CreateRenderer(m_window, -1, SDL_RENDERER_SOFTWARE);
     }
+    if (!m_renderer) {
+        std::cerr << "[SDL] Renderer creation failed: " << SDL_GetError() << std::endl;
+        return false;
+    }
 
-    // Load Font
+    // Load Fonts
 #ifdef __SWITCH__
     PlFontData sharedFont;
-    if (R_SUCCEEDED(plInitialize(PlServiceType_User))) {
-        if (R_SUCCEEDED(plGetSharedFontByType(&sharedFont, PlSharedFontType_Standard))) {
+    Result rcPl = plInitialize(PlServiceType_User);
+    std::cout << "[Font] plInitialize: 0x" << std::hex << rcPl << std::endl;
+    if (R_SUCCEEDED(rcPl)) {
+        Result rcFont = plGetSharedFontByType(&sharedFont, PlSharedFontType_Standard);
+        std::cout << "[Font] plGetSharedFontByType: 0x" << std::hex << rcFont
+                  << " addr: " << sharedFont.address
+                  << " size: " << std::dec << sharedFont.size << std::endl;
+        if (R_SUCCEEDED(rcFont) && sharedFont.address && sharedFont.size > 0) {
             m_fontSmall = TTF_OpenFontRW(SDL_RWFromMem(sharedFont.address, sharedFont.size), 0, 18);
             m_fontMedium = TTF_OpenFontRW(SDL_RWFromMem(sharedFont.address, sharedFont.size), 0, 24);
             m_fontLarge = TTF_OpenFontRW(SDL_RWFromMem(sharedFont.address, sharedFont.size), 0, 36);
@@ -104,9 +119,16 @@ bool UiEngine::initialize() {
     }
 #endif
 
-    // Initialize Addon Manager and Player
+    std::cout << "[Font] Font status: small=" << (m_fontSmall != nullptr)
+              << " medium=" << (m_fontMedium != nullptr)
+              << " large=" << (m_fontLarge != nullptr) << std::endl;
+
+    // Load installed addons
+    std::cout << "[Config] Loading addon configurations..." << std::endl;
     m_addonManager.loadConfig();
-    m_player.initialize();
+    std::cout << "[Config] Active addons: " << m_addonManager.getAddons().size() << std::endl;
+
+    // Do NOT initialize player here: initialize lazily on playback to avoid GPU/audio conflict!
 
     // Fetch initial catalog
     loadCatalogData();
@@ -121,6 +143,7 @@ void UiEngine::shutdown() {
     if (m_fontSmall) TTF_CloseFont(m_fontSmall);
     if (m_fontMedium) TTF_CloseFont(m_fontMedium);
     if (m_fontLarge) TTF_CloseFont(m_fontLarge);
+    m_fontSmall = m_fontMedium = m_fontLarge = nullptr;
 
 #ifdef __SWITCH__
     plExit();
@@ -128,8 +151,14 @@ void UiEngine::shutdown() {
 
     TTF_Quit();
 
-    if (m_renderer) SDL_DestroyRenderer(m_renderer);
-    if (m_window) SDL_DestroyWindow(m_window);
+    if (m_renderer) {
+        SDL_DestroyRenderer(m_renderer);
+        m_renderer = nullptr;
+    }
+    if (m_window) {
+        SDL_DestroyWindow(m_window);
+        m_window = nullptr;
+    }
     SDL_Quit();
 }
 
@@ -137,9 +166,17 @@ void UiEngine::loadCatalogData() {
     m_isLoading = true;
     m_items.clear();
 
-    auto catalogAddon = m_addonManager.getCatalogAddon(m_contentType);
-    if (catalogAddon) {
-        m_items = StremioClient::fetchCatalog(*catalogAddon, m_contentType, "top");
+    try {
+        auto catalogAddon = m_addonManager.getCatalogAddon(m_contentType);
+        if (catalogAddon) {
+            std::cout << "[Catalog] Requesting " << m_contentType << " from " << catalogAddon->name << "..." << std::endl;
+            m_items = StremioClient::fetchCatalog(*catalogAddon, m_contentType, "top");
+            std::cout << "[Catalog] Received " << m_items.size() << " items." << std::endl;
+        } else {
+            std::cerr << "[Catalog] No catalog addon active for type " << m_contentType << std::endl;
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "[Catalog] Error loading catalog: " << e.what() << std::endl;
     }
 
     m_selectedGridIndex = 0;
@@ -147,6 +184,7 @@ void UiEngine::loadCatalogData() {
 }
 
 void UiEngine::drawRect(int x, int y, int w, int h, SDL_Color color, bool filled) {
+    if (!m_renderer) return;
     SDL_SetRenderDrawColor(m_renderer, color.r, color.g, color.b, color.a);
     SDL_Rect r = {x, y, w, h};
     if (filled) {
@@ -157,11 +195,13 @@ void UiEngine::drawRect(int x, int y, int w, int h, SDL_Color color, bool filled
 }
 
 void UiEngine::drawText(const std::string& text, int x, int y, SDL_Color color, int fontSize, bool rightAlign) {
+    if (!m_renderer || text.empty()) return;
+
     TTF_Font* font = m_fontMedium;
     if (fontSize <= 18) font = m_fontSmall;
     else if (fontSize >= 32) font = m_fontLarge;
 
-    if (!font || text.empty()) return;
+    if (!font) return;
 
     SDL_Surface* surface = TTF_RenderUTF8_Blended(font, text.c_str(), color);
     if (!surface) return;
@@ -216,7 +256,14 @@ void UiEngine::drawFooter() {
 
 void UiEngine::renderCatalog() {
     if (m_isLoading) {
-        drawText("Loading Stremio Catalogs...", 500, 340, {200, 200, 220, 255}, 24);
+        drawText("Connecting to Stremio Catalogs...", 460, 330, {200, 200, 220, 255}, 24);
+        drawText("Please wait...", 560, 370, {150, 155, 175, 255}, 18);
+        return;
+    }
+
+    if (m_items.empty()) {
+        drawText("No catalog items loaded.", 500, 300, {230, 100, 100, 255}, 24);
+        drawText("Check Wi-Fi connection, or press (-) to view Addons.", 410, 350, {180, 185, 205, 255}, 20);
         return;
     }
 
@@ -252,11 +299,11 @@ void UiEngine::renderCatalog() {
             drawRect(x - 1, y - 1, cardW + 2, cardH + 2, {0, 212, 255, 255}, false);
         }
 
-        // Poster Placeholder / Header
+        // Poster Placeholder
         drawRect(x + 10, y + 10, cardW - 20, 150, {15, 17, 24, 255});
         drawText("POSTER", x + cardW / 2, y + 70, {70, 75, 95, 255}, 18, true);
 
-        // Movie Title (truncate if too long)
+        // Movie Title
         std::string title = item.name;
         if (title.length() > 22) title = title.substr(0, 20) + "..";
         drawText(title, x + 15, y + 172, {240, 240, 255, 255}, 20);
@@ -274,7 +321,7 @@ void UiEngine::renderCatalog() {
 }
 
 void UiEngine::renderDetails() {
-    // Backdrop / Hero Panel
+    // Backdrop Panel
     drawRect(40, 90, 1200, 550, {22, 25, 36, 255});
 
     // Poster Box
@@ -297,20 +344,18 @@ void UiEngine::renderDetails() {
     // Synopsis
     drawText("Synopsis:", 360, 260, {200, 200, 220, 255}, 20);
     std::string desc = m_selectedMeta.description;
-    // Simple multi-line wrap
     size_t lineLen = 65;
     for (size_t i = 0; i < 4 && i * lineLen < desc.length(); ++i) {
         std::string chunk = desc.substr(i * lineLen, lineLen);
         drawText(chunk, 360, 295 + static_cast<int>(i) * 26, {180, 185, 205, 255}, 18);
     }
 
-    // Series episode info if series
     if (!m_selectedMeta.videos.empty()) {
         std::string epCount = "Episodes Available: " + std::to_string(m_selectedMeta.videos.size());
         drawText(epCount, 360, 420, {0, 212, 255, 255}, 18);
     }
 
-    // Action Button: "FIND STREAMS"
+    // Action Button
     bool btnFocus = (m_detailsActionIndex == 0);
     SDL_Color btnBg = btnFocus ? SDL_Color{109, 93, 252, 255} : SDL_Color{50, 55, 75, 255};
     drawRect(360, 470, 260, 55, btnBg);
@@ -321,10 +366,8 @@ void UiEngine::renderDetails() {
 }
 
 void UiEngine::renderStreams() {
-    // Dim background
     drawRect(0, 0, 1280, 720, {10, 10, 15, 200});
 
-    // Modal Box
     int mw = 840;
     int mh = 500;
     int mx = (1280 - mw) / 2;
@@ -356,12 +399,10 @@ void UiEngine::renderStreams() {
             drawRect(mx + 18, y - 2, mw - 36, itemH - 4, {109, 93, 252, 255}, false);
         }
 
-        // Stream Name / Quality
         std::string streamName = stream.name;
         std::replace(streamName.begin(), streamName.end(), '\n', ' ');
         drawText(streamName, mx + 40, y + 10, {0, 212, 255, 255}, 20);
 
-        // Stream Description / Torrent Details
         std::string title = stream.title;
         std::replace(title.begin(), title.end(), '\n', ' ');
         if (title.length() > 60) title = title.substr(0, 58) + "..";
@@ -401,16 +442,12 @@ void UiEngine::renderAddons() {
 void UiEngine::renderPlayer() {
     PlaybackState st = m_player.getState();
 
-    // If OSD is visible, draw video HUD overlay
     if (m_showOsd) {
-        // Top banner
         drawRect(0, 0, 1280, 80, {10, 12, 18, 220});
         drawText("▶  " + st.currentTitle, 40, 26, {255, 255, 255, 255}, 26);
 
-        // Bottom HUD
         drawRect(0, 600, 1280, 120, {10, 12, 18, 220});
 
-        // Time Progress Text
         auto formatTime = [](double sec) {
             int s = static_cast<int>(sec);
             int m = s / 60;
@@ -428,7 +465,6 @@ void UiEngine::renderPlayer() {
             drawText("PAUSED", 1200, 620, {230, 180, 50, 255}, 20, true);
         }
 
-        // Progress Bar
         int barX = 40;
         int barY = 655;
         int barW = 1200;
@@ -438,7 +474,6 @@ void UiEngine::renderPlayer() {
         if (st.duration > 0.0) {
             int filledW = static_cast<int>((st.currentTime / st.duration) * barW);
             drawRect(barX, barY, filledW, barH, {109, 93, 252, 255});
-            // Handle
             drawRect(barX + filledW - 4, barY - 4, 8, 18, {0, 212, 255, 255});
         }
     }
@@ -467,13 +502,18 @@ void UiEngine::openAddAddon() {
 
 void UiEngine::playStream(const StreamItem& stream) {
     if (!stream.url.empty()) {
+        std::cout << "[Playback] Launching stream: " << stream.name << " URL: " << stream.url << std::endl;
+        if (!m_player.isInitialized()) {
+            std::cout << "[Playback] Initializing libmpv..." << std::endl;
+            if (!m_player.initialize()) {
+                std::cerr << "[Playback] Failed to initialize libmpv!" << std::endl;
+                return;
+            }
+        }
         m_player.play(stream.url, m_selectedMeta.name + " (" + stream.name + ")");
         m_state = UiState::PLAYER;
         m_lastPlayerInputTime = SDL_GetTicks();
         m_showOsd = true;
-    } else if (!stream.infoHash.empty()) {
-        std::cout << "P2P torrent stream selected (infoHash: " << stream.infoHash << ")" << std::endl;
-        // Direct torrent handling
     }
 }
 
@@ -499,6 +539,7 @@ void UiEngine::handleInput() {
                     case SDLK_ESCAPE:
                     case SDLK_BACKSPACE:
                         m_player.stop();
+                        m_player.shutdown(); // Release GPU surface back to SDL2
                         m_state = UiState::DETAILS;
                         break;
                     case SDLK_LEFT:
@@ -519,13 +560,14 @@ void UiEngine::handleInput() {
                 m_showOsd = true;
 
                 // Joy-Con Buttons
-                // 0: A, 1: B, 2: X, 3: Y, 9: Plus, 10: Minus
+                // 0: A, 1: B, 2: X, 3: Y, 10: Plus
                 if (event.jbutton.button == 0) { // A
                     m_player.togglePause();
                 } else if (event.jbutton.button == 1) { // B
                     m_player.stop();
+                    m_player.shutdown(); // Release GPU surface back to SDL2
                     m_state = UiState::DETAILS;
-                } else if (event.jbutton.button == 9) { // Plus
+                } else if (event.jbutton.button == 10) { // Plus
                     m_showOsd = !m_showOsd;
                 }
             }
@@ -612,7 +654,7 @@ void UiEngine::handleInput() {
             }
         } else if (event.type == SDL_JOYBUTTONDOWN) {
             // Joy-Con Buttons
-            // 0: A, 1: B, 2: X, 3: Y, 9: Plus, 10: Minus
+            // 0: A, 1: B, 2: X, 3: Y, 10: Plus, 11: Minus
             switch (event.jbutton.button) {
                 case 0: // A (Confirm)
                     if (m_state == UiState::CATALOG && !m_items.empty()) {
@@ -660,11 +702,11 @@ void UiEngine::handleInput() {
                     loadCatalogData();
                     break;
 
-                case 9: // Plus (Exit)
+                case 10: // Plus (Exit)
                     m_running = false;
                     break;
 
-                case 10: // Minus (Addons menu)
+                case 11: // Minus (Addons menu)
                     m_state = (m_state == UiState::ADDONS) ? UiState::CATALOG : UiState::ADDONS;
                     break;
             }
@@ -673,7 +715,6 @@ void UiEngine::handleInput() {
 }
 
 void UiEngine::update() {
-    // Auto-hide player OSD after 4 seconds
     if (m_state == UiState::PLAYER && m_showOsd) {
         if (SDL_GetTicks() - m_lastPlayerInputTime > 4000) {
             m_showOsd = false;
@@ -682,7 +723,8 @@ void UiEngine::update() {
 }
 
 void UiEngine::render() {
-    // Clear screen to deep theme color
+    if (!m_renderer) return;
+
     SDL_SetRenderDrawColor(m_renderer, 15, 16, 22, 255);
     SDL_RenderClear(m_renderer);
 
@@ -721,7 +763,7 @@ void UiEngine::run() {
         handleInput();
         update();
         render();
-        SDL_Delay(16); // ~60 FPS
+        SDL_Delay(16);
     }
 }
 
