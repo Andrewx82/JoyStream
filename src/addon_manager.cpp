@@ -1,0 +1,190 @@
+#include "stremio/addon_manager.hpp"
+#include "stremio/stremio_client.hpp"
+#include <fstream>
+#include <iostream>
+#include <sys/stat.h>
+
+#ifdef __SWITCH__
+#include <switch.h>
+#endif
+
+namespace Stremio {
+
+std::string AddonManager::getDefaultConfigPath() {
+#ifdef __SWITCH__
+    return "sdmc:/switch/joystream/addons.json";
+#else
+    return "addons.json";
+#endif
+}
+
+AddonManager::AddonManager() {
+    m_configPath = getDefaultConfigPath();
+}
+
+bool AddonManager::loadConfig(const std::string& path) {
+    if (!path.empty()) {
+        m_configPath = path;
+    }
+
+    std::ifstream file(m_configPath);
+    if (!file.is_open()) {
+        std::cout << "No existing config at " << m_configPath << ". Initializing with defaults." << std::endl;
+        // Seed default addons: Cinemeta
+        addAddon("https://v3-cinemeta.strem.io");
+        saveConfig();
+        return true;
+    }
+
+    try {
+        json j;
+        file >> j;
+        m_addons.clear();
+
+        if (j.contains("addons") && j["addons"].is_array()) {
+            for (const auto& a : j["addons"]) {
+                std::string url = a.value("url", "");
+                bool enabled = a.value("enabled", true);
+                if (!url.empty()) {
+                    auto manifestOpt = StremioClient::fetchManifest(url);
+                    if (manifestOpt) {
+                        InstalledAddon installed;
+                        installed.url = StremioClient::normalizeAddonUrl(url);
+                        installed.enabled = enabled;
+                        installed.manifest = *manifestOpt;
+                        m_addons.push_back(installed);
+                    }
+                }
+            }
+        }
+        return true;
+    } catch (const std::exception& e) {
+        std::cerr << "Error reading addon config: " << e.what() << std::endl;
+        return false;
+    }
+}
+
+bool AddonManager::saveConfig(const std::string& path) {
+    std::string outPath = path.empty() ? m_configPath : path;
+
+    // Ensure parent directories exist
+#ifdef __SWITCH__
+    mkdir("sdmc:/switch", 0777);
+    mkdir("sdmc:/switch/joystream", 0777);
+#endif
+
+    json j;
+    j["addons"] = json::array();
+
+    for (const auto& addon : m_addons) {
+        json a;
+        a["url"] = addon.url;
+        a["enabled"] = addon.enabled;
+        a["name"] = addon.manifest.name;
+        j["addons"].push_back(a);
+    }
+
+    std::ofstream file(outPath);
+    if (!file.is_open()) {
+        std::cerr << "Failed to open config file for writing: " << outPath << std::endl;
+        return false;
+    }
+
+    file << j.dump(4);
+    return true;
+}
+
+bool AddonManager::addAddon(const std::string& url) {
+    std::string cleanUrl = StremioClient::normalizeAddonUrl(url);
+
+    // Check if already installed
+    for (const auto& existing : m_addons) {
+        if (existing.url == cleanUrl) {
+            std::cout << "Addon already installed: " << cleanUrl << std::endl;
+            return false;
+        }
+    }
+
+    auto manifestOpt = StremioClient::fetchManifest(cleanUrl);
+    if (!manifestOpt) {
+        std::cerr << "Could not fetch manifest for: " << cleanUrl << std::endl;
+        return false;
+    }
+
+    InstalledAddon installed;
+    installed.url = cleanUrl;
+    installed.enabled = true;
+    installed.manifest = *manifestOpt;
+
+    m_addons.push_back(installed);
+    saveConfig();
+    return true;
+}
+
+bool AddonManager::removeAddon(const std::string& idOrUrl) {
+    auto it = std::remove_if(m_addons.begin(), m_addons.end(), [&](const InstalledAddon& a) {
+        return a.url == idOrUrl || a.manifest.id == idOrUrl;
+    });
+
+    if (it != m_addons.end()) {
+        m_addons.erase(it, m_addons.end());
+        saveConfig();
+        return true;
+    }
+    return false;
+}
+
+void AddonManager::setAddonEnabled(const std::string& id, bool enabled) {
+    for (auto& a : m_addons) {
+        if (a.manifest.id == id || a.url == id) {
+            a.enabled = enabled;
+            saveConfig();
+            break;
+        }
+    }
+}
+
+std::optional<AddonManifest> AddonManager::getCatalogAddon(const std::string& type) const {
+    for (const auto& a : m_addons) {
+        if (a.enabled && a.manifest.supportsResource("catalog") && a.manifest.supportsType(type)) {
+            return a.manifest;
+        }
+    }
+    return std::nullopt;
+}
+
+std::vector<StreamItem> AddonManager::aggregateStreams(const std::string& type, const std::string& id) {
+    std::vector<StreamItem> allStreams;
+
+    for (const auto& addon : m_addons) {
+        if (!addon.enabled) continue;
+        if (!addon.manifest.supportsResource("stream")) continue;
+
+        auto streams = StremioClient::fetchStreams(addon.manifest, type, id);
+        for (auto& s : streams) {
+            // Tag with addon name if not present
+            if (s.name.empty() || s.name == "Stream") {
+                s.name = addon.manifest.name;
+            }
+            allStreams.push_back(std::move(s));
+        }
+    }
+
+    return allStreams;
+}
+
+std::vector<SubtitleItem> AddonManager::aggregateSubtitles(const std::string& type, const std::string& id) {
+    std::vector<SubtitleItem> allSubs;
+
+    for (const auto& addon : m_addons) {
+        if (!addon.enabled) continue;
+        if (!addon.manifest.supportsResource("subtitles")) continue;
+
+        auto subs = StremioClient::fetchSubtitles(addon.manifest, type, id);
+        allSubs.insert(allSubs.end(), subs.begin(), subs.end());
+    }
+
+    return allSubs;
+}
+
+} // namespace Stremio

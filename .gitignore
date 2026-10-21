@@ -1,0 +1,22 @@
+# Build directories
+build/
+build-desktop/
+build-switch/
+.dkp-generated/
+
+# Compiled objects
+*.o
+*.d
+*.map
+*.elf
+*.nro
+*.nacp
+
+# Test & desktop binaries
+test_stremio_core
+joystream-desktop
+tests/test_stremio_core
+
+# Temporary files
+*.tmp
+.DS_Store
