@@ -4,9 +4,16 @@
 #include "stremio/addon_manager.hpp"
 #include "stremio/player.hpp"
 #include <SDL2/SDL.h>
+#include <SDL2/SDL_image.h>
 #include <SDL2/SDL_ttf.h>
 #include <vector>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <queue>
+#include <thread>
+#include <mutex>
+#include <atomic>
 #include <memory>
 
 namespace Stremio {
@@ -32,6 +39,25 @@ private:
     void handleInput();
     void update();
     void render();
+
+    // Input actions
+    void onNavigateLeft();
+    void onNavigateRight();
+    void onNavigateUp();
+    void onNavigateDown();
+    void onPagePrev();
+    void onPageNext();
+    void onActionConfirm();
+    void onActionBack();
+    void onActionSearch();
+    void onActionToggleType();
+    void onActionMenu();
+    void onActionExit();
+
+    // Poster Image Pipeline
+    void queuePosterDownload(const std::string& url);
+    void processDownloadedPosters();
+    void posterDownloaderWorker();
 
     // Render helpers
     void drawText(const std::string& text, int x, int y, SDL_Color color, int fontSize = 20, bool rightAlign = false);
@@ -76,7 +102,7 @@ private:
 
     // Details View
     MetaItem m_selectedMeta;
-    int m_detailsActionIndex = 0; // 0: Play, 1: Back
+    int m_detailsActionIndex = 0;
 
     // Streams View
     std::vector<StreamItem> m_availableStreams;
@@ -88,6 +114,18 @@ private:
     // OSD timer
     uint32_t m_lastPlayerInputTime = 0;
     bool m_showOsd = true;
+
+    // Stick debounce
+    uint32_t m_lastStickNavTime = 0;
+
+    // Poster Textures & Async Downloader
+    std::unordered_map<std::string, SDL_Texture*> m_posterTextures;
+    std::unordered_map<std::string, std::string> m_downloadedImageData;
+    std::queue<std::string> m_posterDownloadQueue;
+    std::unordered_set<std::string> m_queuedUrls;
+    std::mutex m_imageMutex;
+    std::thread m_imageThread;
+    std::atomic<bool> m_imageThreadRunning{false};
 };
 
 } // namespace Stremio

@@ -13,6 +13,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch" OR NINTENDO_SWITCH)
         mpv
         libcurl
         sdl2
+        SDL2_image
         SDL2_ttf
     )
 
@@ -52,7 +53,7 @@ else()
     # Host build (Desktop / Tests)
     find_package(CURL REQUIRED)
     find_package(PkgConfig REQUIRED)
-    pkg_check_modules(DEPS REQUIRED mpv sdl2 SDL2_ttf)
+    pkg_check_modules(DEPS REQUIRED mpv sdl2 SDL2_image SDL2_ttf)
 
     add_executable(test_stremio_core
         tests/test_stremio_core.cpp

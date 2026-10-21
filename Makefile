@@ -40,7 +40,7 @@ ASFLAGS		:=	-g $(ARCH)
 LDFLAGS		=	-specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
 
 # Use Switch pkg-config for all static library dependencies
-LIBS		:=	$(shell $(PORTLIBS)/bin/aarch64-none-elf-pkg-config --libs mpv libcurl sdl2 SDL2_ttf) -lnx
+LIBS		:=	$(shell $(PORTLIBS)/bin/aarch64-none-elf-pkg-config --libs mpv libcurl sdl2 SDL2_image SDL2_ttf) -lnx
 
 #---------------------------------------------------------------------------------
 # List of directories containing libraries
@@ -77,7 +77,7 @@ export HFILES_BIN	:=	$(addsuffix .h,$(subst .,_,$(BINFILES)))
 
 export INCLUDE		:=	$(foreach dir,$(INCLUDES),-I$(TOPDIR)/$(dir)) \
 						$(foreach dir,$(LIBDIRS),-I$(dir)/include) \
-						$(shell $(PORTLIBS)/bin/aarch64-none-elf-pkg-config --cflags mpv libcurl sdl2 SDL2_ttf) \
+						$(shell $(PORTLIBS)/bin/aarch64-none-elf-pkg-config --cflags mpv libcurl sdl2 SDL2_image SDL2_ttf) \
 						-I$(TOPDIR)/$(BUILD)
 
 export CFLAGS		:=	$(CFLAGS) $(INCLUDE)

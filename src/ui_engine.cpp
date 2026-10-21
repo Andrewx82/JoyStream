@@ -1,9 +1,11 @@
 #include "stremio/ui_engine.hpp"
 #include "stremio/stremio_client.hpp"
+#include "stremio/http_client.hpp"
 #include <iostream>
 #include <iomanip>
 #include <sstream>
 #include <cmath>
+#include <chrono>
 
 #ifdef __SWITCH__
 #include <switch.h>
@@ -51,6 +53,11 @@ bool UiEngine::initialize() {
     if (TTF_Init() < 0) {
         std::cerr << "[TTF] TTF_Init failed: " << TTF_GetError() << std::endl;
         return false;
+    }
+
+    int imgFlags = IMG_INIT_JPG | IMG_INIT_PNG | IMG_INIT_WEBP;
+    if ((IMG_Init(imgFlags) & imgFlags) != imgFlags) {
+        std::cerr << "[IMG] Warning: IMG_Init: " << IMG_GetError() << std::endl;
     }
 
     // Open Joysticks on Switch
@@ -128,7 +135,9 @@ bool UiEngine::initialize() {
     m_addonManager.loadConfig();
     std::cout << "[Config] Active addons: " << m_addonManager.getAddons().size() << std::endl;
 
-    // Do NOT initialize player here: initialize lazily on playback to avoid GPU/audio conflict!
+    // Start background image loader thread
+    m_imageThreadRunning = true;
+    m_imageThread = std::thread(&UiEngine::posterDownloaderWorker, this);
 
     // Fetch initial catalog
     loadCatalogData();
@@ -138,7 +147,18 @@ bool UiEngine::initialize() {
 }
 
 void UiEngine::shutdown() {
+    m_imageThreadRunning = false;
+    if (m_imageThread.joinable()) {
+        m_imageThread.join();
+    }
+
     m_player.shutdown();
+
+    // Destroy cached textures
+    for (auto& [url, tex] : m_posterTextures) {
+        if (tex) SDL_DestroyTexture(tex);
+    }
+    m_posterTextures.clear();
 
     if (m_fontSmall) TTF_CloseFont(m_fontSmall);
     if (m_fontMedium) TTF_CloseFont(m_fontMedium);
@@ -149,6 +169,7 @@ void UiEngine::shutdown() {
     plExit();
 #endif
 
+    IMG_Quit();
     TTF_Quit();
 
     if (m_renderer) {
@@ -160,6 +181,67 @@ void UiEngine::shutdown() {
         m_window = nullptr;
     }
     SDL_Quit();
+}
+
+void UiEngine::posterDownloaderWorker() {
+    while (m_imageThreadRunning) {
+        std::string nextUrl;
+        {
+            std::lock_guard<std::mutex> lock(m_imageMutex);
+            if (!m_posterDownloadQueue.empty()) {
+                nextUrl = m_posterDownloadQueue.front();
+                m_posterDownloadQueue.pop();
+            }
+        }
+
+        if (nextUrl.empty()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            continue;
+        }
+
+        // Fetch image bytes via HTTP
+        std::map<std::string, std::string> emptyHeaders;
+        HttpResponse resp = HttpClient::get(nextUrl, emptyHeaders, 8);
+        if (resp.success && !resp.body.empty()) {
+            std::lock_guard<std::mutex> lock(m_imageMutex);
+            m_downloadedImageData[nextUrl] = std::move(resp.body);
+        }
+    }
+}
+
+void UiEngine::queuePosterDownload(const std::string& url) {
+    if (url.empty()) return;
+    std::lock_guard<std::mutex> lock(m_imageMutex);
+    if (m_posterTextures.find(url) == m_posterTextures.end() &&
+        m_queuedUrls.find(url) == m_queuedUrls.end()) {
+        m_queuedUrls.insert(url);
+        m_posterDownloadQueue.push(url);
+    }
+}
+
+void UiEngine::processDownloadedPosters() {
+    std::unordered_map<std::string, std::string> readyImages;
+    {
+        std::lock_guard<std::mutex> lock(m_imageMutex);
+        if (!m_downloadedImageData.empty()) {
+            readyImages = std::move(m_downloadedImageData);
+            m_downloadedImageData.clear();
+        }
+    }
+
+    for (auto& [url, data] : readyImages) {
+        SDL_RWops* rw = SDL_RWFromMem(static_cast<void*>(data.data()), static_cast<int>(data.size()));
+        if (!rw) continue;
+
+        SDL_Surface* surface = IMG_Load_RW(rw, 1);
+        if (surface) {
+            SDL_Texture* tex = SDL_CreateTextureFromSurface(m_renderer, surface);
+            if (tex) {
+                m_posterTextures[url] = tex;
+            }
+            SDL_FreeSurface(surface);
+        }
+    }
 }
 
 void UiEngine::loadCatalogData() {
@@ -177,6 +259,12 @@ void UiEngine::loadCatalogData() {
         }
     } catch (const std::exception& e) {
         std::cerr << "[Catalog] Error loading catalog: " << e.what() << std::endl;
+    }
+
+    // Queue visible page posters immediately
+    int itemsPerPage = m_gridCols * m_gridRows;
+    for (int i = 0; i < itemsPerPage && i < static_cast<int>(m_items.size()); ++i) {
+        queuePosterDownload(m_items[i].poster);
     }
 
     m_selectedGridIndex = 0;
@@ -228,6 +316,12 @@ void UiEngine::drawHeader() {
     std::string tab = (m_contentType == "movie") ? "[ Movies ]   Series" : "  Movies   [ Series ]";
     drawText(tab, 300, 24, {220, 220, 240, 255}, 20);
 
+    // Page indicator
+    int itemsPerPage = m_gridCols * m_gridRows;
+    int totalPages = std::max(1, static_cast<int>(std::ceil(static_cast<double>(m_items.size()) / itemsPerPage)));
+    std::string pageInfo = "Page " + std::to_string(m_page + 1) + " / " + std::to_string(totalPages);
+    drawText(pageInfo, 900, 24, {160, 165, 185, 255}, 18);
+
     // Addons Status
     std::string addonInfo = std::to_string(m_addonManager.getAddons().size()) + " Addons Active";
     drawText(addonInfo, 1240, 24, {140, 145, 170, 255}, 18, true);
@@ -240,15 +334,15 @@ void UiEngine::drawFooter() {
 
     std::string hints;
     if (m_state == UiState::CATALOG) {
-        hints = "(A) Select   (X) Search   (Y) Switch Type   (-) Addons   (+) Exit";
+        hints = "(D-Pad) Move   (A) Select   (L/R) Page   (X) Search   (Y) Type   (-) Addons   (+) Exit";
     } else if (m_state == UiState::DETAILS) {
         hints = "(A) Find Streams   (B) Back to Catalog";
     } else if (m_state == UiState::STREAMS) {
-        hints = "(A) Play Stream   (B) Cancel";
+        hints = "(D-Pad) Select Stream   (A) Play Stream   (B) Cancel";
     } else if (m_state == UiState::ADDONS) {
-        hints = "(A) Toggle Addon   (X) Add New Addon   (B) Back";
+        hints = "(D-Pad) Navigate   (A) Toggle   (X) Add New Addon   (B) Back";
     } else if (m_state == UiState::PLAYER) {
-        hints = "(A) Play/Pause   (B) Stop   (D-Pad) Seek   (+) OSD";
+        hints = "(A) Play/Pause   (B) Stop   (D-Pad Left/Right) Seek 10s   (+) OSD";
     }
 
     drawText(hints, 40, 678, {160, 165, 185, 255}, 18);
@@ -299,9 +393,25 @@ void UiEngine::renderCatalog() {
             drawRect(x - 1, y - 1, cardW + 2, cardH + 2, {0, 212, 255, 255}, false);
         }
 
-        // Poster Placeholder
-        drawRect(x + 10, y + 10, cardW - 20, 150, {15, 17, 24, 255});
-        drawText("POSTER", x + cardW / 2, y + 70, {70, 75, 95, 255}, 18, true);
+        // Render Poster
+        SDL_Rect posterDst = {x + 10, y + 10, cardW - 20, 150};
+        bool posterRendered = false;
+
+        if (!item.poster.empty()) {
+            auto it = m_posterTextures.find(item.poster);
+            if (it != m_posterTextures.end() && it->second) {
+                SDL_RenderCopy(m_renderer, it->second, nullptr, &posterDst);
+                posterRendered = true;
+            } else {
+                queuePosterDownload(item.poster);
+            }
+        }
+
+        if (!posterRendered) {
+            drawRect(posterDst.x, posterDst.y, posterDst.w, posterDst.h, {15, 17, 24, 255});
+            std::string shortTitle = item.name.substr(0, 12);
+            drawText(shortTitle, x + cardW / 2, y + 70, {80, 85, 110, 255}, 18, true);
+        }
 
         // Movie Title
         std::string title = item.name;
@@ -321,12 +431,24 @@ void UiEngine::renderCatalog() {
 }
 
 void UiEngine::renderDetails() {
-    // Backdrop Panel
     drawRect(40, 90, 1200, 550, {22, 25, 36, 255});
 
-    // Poster Box
-    drawRect(70, 120, 260, 390, {15, 17, 24, 255});
-    drawText("POSTER PREVIEW", 130, 300, {90, 95, 120, 255}, 18);
+    // Poster
+    SDL_Rect posterDst = {70, 120, 260, 390};
+    bool posterRendered = false;
+    if (!m_selectedMeta.poster.empty()) {
+        auto it = m_posterTextures.find(m_selectedMeta.poster);
+        if (it != m_posterTextures.end() && it->second) {
+            SDL_RenderCopy(m_renderer, it->second, nullptr, &posterDst);
+            posterRendered = true;
+        } else {
+            queuePosterDownload(m_selectedMeta.poster);
+        }
+    }
+    if (!posterRendered) {
+        drawRect(posterDst.x, posterDst.y, posterDst.w, posterDst.h, {15, 17, 24, 255});
+        drawText("POSTER", 160, 300, {90, 95, 120, 255}, 20);
+    }
 
     // Title & Info
     drawText(m_selectedMeta.name, 360, 130, {255, 255, 255, 255}, 32);
@@ -487,7 +609,14 @@ void UiEngine::openSearch() {
         if (catalogAddon) {
             m_items = StremioClient::searchCatalog(*catalogAddon, m_contentType, query);
             m_selectedGridIndex = 0;
+            m_page = 0;
             m_state = UiState::CATALOG;
+
+            // Pre-queue first page posters
+            int itemsPerPage = m_gridCols * m_gridRows;
+            for (int i = 0; i < itemsPerPage && i < static_cast<int>(m_items.size()); ++i) {
+                queuePosterDownload(m_items[i].poster);
+            }
         }
         m_isLoading = false;
     }
@@ -517,6 +646,182 @@ void UiEngine::playStream(const StreamItem& stream) {
     }
 }
 
+// ----------------- Navigation Actions -----------------
+
+void UiEngine::onNavigateLeft() {
+    if (m_state == UiState::CATALOG) {
+        if (m_selectedGridIndex % m_gridCols > 0) {
+            m_selectedGridIndex--;
+        } else if (m_page > 0) {
+            onPagePrev();
+            m_selectedGridIndex += (m_gridCols - 1);
+        }
+    } else if (m_state == UiState::PLAYER) {
+        m_player.seekRelative(-10.0);
+        m_lastPlayerInputTime = SDL_GetTicks();
+        m_showOsd = true;
+    }
+}
+
+void UiEngine::onNavigateRight() {
+    if (m_state == UiState::CATALOG) {
+        int itemsPerPage = m_gridCols * m_gridRows;
+        int maxItemsOnPage = std::min(itemsPerPage, static_cast<int>(m_items.size()) - m_page * itemsPerPage);
+
+        if (m_selectedGridIndex % m_gridCols < m_gridCols - 1 && m_selectedGridIndex + 1 < maxItemsOnPage) {
+            m_selectedGridIndex++;
+        } else if ((m_page + 1) * itemsPerPage < static_cast<int>(m_items.size())) {
+            onPageNext();
+            m_selectedGridIndex -= (m_gridCols - 1);
+            if (m_selectedGridIndex < 0) m_selectedGridIndex = 0;
+        }
+    } else if (m_state == UiState::PLAYER) {
+        m_player.seekRelative(10.0);
+        m_lastPlayerInputTime = SDL_GetTicks();
+        m_showOsd = true;
+    }
+}
+
+void UiEngine::onNavigateUp() {
+    if (m_state == UiState::CATALOG) {
+        if (m_selectedGridIndex >= m_gridCols) {
+            m_selectedGridIndex -= m_gridCols;
+        }
+    } else if (m_state == UiState::STREAMS) {
+        if (m_selectedStreamIndex > 0) {
+            m_selectedStreamIndex--;
+        }
+    } else if (m_state == UiState::ADDONS) {
+        if (m_selectedAddonIndex > 0) {
+            m_selectedAddonIndex--;
+        }
+    } else if (m_state == UiState::PLAYER) {
+        m_player.seekRelative(60.0);
+        m_lastPlayerInputTime = SDL_GetTicks();
+        m_showOsd = true;
+    }
+}
+
+void UiEngine::onNavigateDown() {
+    if (m_state == UiState::CATALOG) {
+        int itemsPerPage = m_gridCols * m_gridRows;
+        int maxItemsOnPage = std::min(itemsPerPage, static_cast<int>(m_items.size()) - m_page * itemsPerPage);
+        if (m_selectedGridIndex + m_gridCols < maxItemsOnPage) {
+            m_selectedGridIndex += m_gridCols;
+        }
+    } else if (m_state == UiState::STREAMS) {
+        if (m_selectedStreamIndex + 1 < static_cast<int>(m_availableStreams.size())) {
+            m_selectedStreamIndex++;
+        }
+    } else if (m_state == UiState::ADDONS) {
+        if (m_selectedAddonIndex + 1 < static_cast<int>(m_addonManager.getAddons().size())) {
+            m_selectedAddonIndex++;
+        }
+    } else if (m_state == UiState::PLAYER) {
+        m_player.seekRelative(-60.0);
+        m_lastPlayerInputTime = SDL_GetTicks();
+        m_showOsd = true;
+    }
+}
+
+void UiEngine::onPagePrev() {
+    if (m_state == UiState::CATALOG && m_page > 0) {
+        m_page--;
+        m_selectedGridIndex = 0;
+        int itemsPerPage = m_gridCols * m_gridRows;
+        int startIndex = m_page * itemsPerPage;
+        for (int i = 0; i < itemsPerPage && (startIndex + i) < static_cast<int>(m_items.size()); ++i) {
+            queuePosterDownload(m_items[startIndex + i].poster);
+        }
+    }
+}
+
+void UiEngine::onPageNext() {
+    if (m_state == UiState::CATALOG) {
+        int itemsPerPage = m_gridCols * m_gridRows;
+        if ((m_page + 1) * itemsPerPage < static_cast<int>(m_items.size())) {
+            m_page++;
+            m_selectedGridIndex = 0;
+            int startIndex = m_page * itemsPerPage;
+            for (int i = 0; i < itemsPerPage && (startIndex + i) < static_cast<int>(m_items.size()); ++i) {
+                queuePosterDownload(m_items[startIndex + i].poster);
+            }
+        }
+    }
+}
+
+void UiEngine::onActionConfirm() {
+    if (m_state == UiState::CATALOG && !m_items.empty()) {
+        int idx = m_page * (m_gridCols * m_gridRows) + m_selectedGridIndex;
+        if (idx < static_cast<int>(m_items.size())) {
+            auto catAddon = m_addonManager.getCatalogAddon(m_contentType);
+            if (catAddon) {
+                auto fullMeta = StremioClient::fetchMeta(*catAddon, m_contentType, m_items[idx].id);
+                m_selectedMeta = fullMeta ? *fullMeta : m_items[idx];
+            } else {
+                m_selectedMeta = m_items[idx];
+            }
+            queuePosterDownload(m_selectedMeta.poster);
+            m_state = UiState::DETAILS;
+        }
+    } else if (m_state == UiState::DETAILS) {
+        m_availableStreams = m_addonManager.aggregateStreams(m_selectedMeta.type, m_selectedMeta.id);
+        m_selectedStreamIndex = 0;
+        m_state = UiState::STREAMS;
+    } else if (m_state == UiState::STREAMS && !m_availableStreams.empty()) {
+        playStream(m_availableStreams[m_selectedStreamIndex]);
+    } else if (m_state == UiState::ADDONS) {
+        const auto& addons = m_addonManager.getAddons();
+        if (m_selectedAddonIndex < static_cast<int>(addons.size())) {
+            m_addonManager.setAddonEnabled(addons[m_selectedAddonIndex].url, !addons[m_selectedAddonIndex].enabled);
+        }
+    } else if (m_state == UiState::PLAYER) {
+        m_player.togglePause();
+        m_lastPlayerInputTime = SDL_GetTicks();
+        m_showOsd = true;
+    }
+}
+
+void UiEngine::onActionBack() {
+    if (m_state == UiState::STREAMS) {
+        m_state = UiState::DETAILS;
+    } else if (m_state == UiState::DETAILS || m_state == UiState::ADDONS) {
+        m_state = UiState::CATALOG;
+    } else if (m_state == UiState::PLAYER) {
+        m_player.stop();
+        m_player.shutdown();
+        m_state = UiState::DETAILS;
+    }
+}
+
+void UiEngine::onActionSearch() {
+    if (m_state == UiState::ADDONS) {
+        openAddAddon();
+    } else {
+        openSearch();
+    }
+}
+
+void UiEngine::onActionToggleType() {
+    if (m_state == UiState::CATALOG) {
+        m_contentType = (m_contentType == "movie") ? "series" : "movie";
+        m_page = 0;
+        loadCatalogData();
+    }
+}
+
+void UiEngine::onActionMenu() {
+    m_state = (m_state == UiState::ADDONS) ? UiState::CATALOG : UiState::ADDONS;
+}
+
+void UiEngine::onActionExit() {
+    if (m_state == UiState::PLAYER) {
+        m_showOsd = !m_showOsd;
+    } else {
+        m_running = false;
+    }
+}
+
 void UiEngine::handleInput() {
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
@@ -525,196 +830,97 @@ void UiEngine::handleInput() {
             return;
         }
 
-        // Handle Player Input
-        if (m_state == UiState::PLAYER) {
-            if (event.type == SDL_KEYDOWN) {
-                m_lastPlayerInputTime = SDL_GetTicks();
-                m_showOsd = true;
-
-                switch (event.key.keysym.sym) {
-                    case SDLK_SPACE:
-                    case SDLK_RETURN:
-                        m_player.togglePause();
-                        break;
-                    case SDLK_ESCAPE:
-                    case SDLK_BACKSPACE:
-                        m_player.stop();
-                        m_player.shutdown(); // Release GPU surface back to SDL2
-                        m_state = UiState::DETAILS;
-                        break;
-                    case SDLK_LEFT:
-                        m_player.seekRelative(-10.0);
-                        break;
-                    case SDLK_RIGHT:
-                        m_player.seekRelative(10.0);
-                        break;
-                    case SDLK_UP:
-                        m_player.seekRelative(60.0);
-                        break;
-                    case SDLK_DOWN:
-                        m_player.seekRelative(-60.0);
-                        break;
-                }
-            } else if (event.type == SDL_JOYBUTTONDOWN) {
-                m_lastPlayerInputTime = SDL_GetTicks();
-                m_showOsd = true;
-
-                // Joy-Con Buttons
-                // 0: A, 1: B, 2: X, 3: Y, 10: Plus
-                if (event.jbutton.button == 0) { // A
-                    m_player.togglePause();
-                } else if (event.jbutton.button == 1) { // B
-                    m_player.stop();
-                    m_player.shutdown(); // Release GPU surface back to SDL2
-                    m_state = UiState::DETAILS;
-                } else if (event.jbutton.button == 10) { // Plus
-                    m_showOsd = !m_showOsd;
-                }
-            }
-            continue;
-        }
-
-        // Keyboard & Controller events for UI Navigation
+        // Keyboard Navigation (Desktop & USB Keyboard)
         if (event.type == SDL_KEYDOWN) {
             switch (event.key.keysym.sym) {
-                case SDLK_ESCAPE:
-                    if (m_state == UiState::DETAILS || m_state == UiState::ADDONS) {
-                        m_state = UiState::CATALOG;
-                    } else if (m_state == UiState::STREAMS) {
-                        m_state = UiState::DETAILS;
-                    } else {
-                        m_running = false;
-                    }
-                    break;
-
-                case SDLK_LEFT:
-                    if (m_state == UiState::CATALOG && m_selectedGridIndex % m_gridCols > 0) {
-                        m_selectedGridIndex--;
-                    }
-                    break;
-                case SDLK_RIGHT:
-                    if (m_state == UiState::CATALOG && m_selectedGridIndex % m_gridCols < m_gridCols - 1) {
-                        m_selectedGridIndex++;
-                    }
-                    break;
-                case SDLK_UP:
-                    if (m_state == UiState::CATALOG && m_selectedGridIndex >= m_gridCols) {
-                        m_selectedGridIndex -= m_gridCols;
-                    } else if (m_state == UiState::STREAMS && m_selectedStreamIndex > 0) {
-                        m_selectedStreamIndex--;
-                    } else if (m_state == UiState::ADDONS && m_selectedAddonIndex > 0) {
-                        m_selectedAddonIndex--;
-                    }
-                    break;
-                case SDLK_DOWN:
-                    if (m_state == UiState::CATALOG && m_selectedGridIndex + m_gridCols < m_gridCols * m_gridRows) {
-                        m_selectedGridIndex += m_gridCols;
-                    } else if (m_state == UiState::STREAMS && m_selectedStreamIndex + 1 < static_cast<int>(m_availableStreams.size())) {
-                        m_selectedStreamIndex++;
-                    } else if (m_state == UiState::ADDONS && m_selectedAddonIndex + 1 < static_cast<int>(m_addonManager.getAddons().size())) {
-                        m_selectedAddonIndex++;
-                    }
-                    break;
-
+                case SDLK_LEFT:      onNavigateLeft(); break;
+                case SDLK_RIGHT:     onNavigateRight(); break;
+                case SDLK_UP:        onNavigateUp(); break;
+                case SDLK_DOWN:      onNavigateDown(); break;
+                case SDLK_PAGEUP:    onPagePrev(); break;
+                case SDLK_PAGEDOWN:  onPageNext(); break;
                 case SDLK_RETURN:
-                case SDLK_SPACE:
-                    if (m_state == UiState::CATALOG && !m_items.empty()) {
-                        int idx = m_page * (m_gridCols * m_gridRows) + m_selectedGridIndex;
-                        if (idx < static_cast<int>(m_items.size())) {
-                            auto catAddon = m_addonManager.getCatalogAddon(m_contentType);
-                            if (catAddon) {
-                                auto fullMeta = StremioClient::fetchMeta(*catAddon, m_contentType, m_items[idx].id);
-                                m_selectedMeta = fullMeta ? *fullMeta : m_items[idx];
-                            } else {
-                                m_selectedMeta = m_items[idx];
-                            }
-                            m_state = UiState::DETAILS;
-                        }
-                    } else if (m_state == UiState::DETAILS) {
-                        m_availableStreams = m_addonManager.aggregateStreams(m_selectedMeta.type, m_selectedMeta.id);
-                        m_selectedStreamIndex = 0;
-                        m_state = UiState::STREAMS;
-                    } else if (m_state == UiState::STREAMS && !m_availableStreams.empty()) {
-                        playStream(m_availableStreams[m_selectedStreamIndex]);
-                    }
-                    break;
-
-                case SDLK_x:
-                    openSearch();
-                    break;
-
-                case SDLK_y:
-                    m_contentType = (m_contentType == "movie") ? "series" : "movie";
-                    loadCatalogData();
-                    break;
-
-                case SDLK_MINUS:
-                    m_state = (m_state == UiState::ADDONS) ? UiState::CATALOG : UiState::ADDONS;
-                    break;
+                case SDLK_SPACE:     onActionConfirm(); break;
+                case SDLK_ESCAPE:
+                case SDLK_BACKSPACE: onActionBack(); break;
+                case SDLK_x:         onActionSearch(); break;
+                case SDLK_y:         onActionToggleType(); break;
+                case SDLK_MINUS:     onActionMenu(); break;
+                case SDLK_PLUS:
+                case SDLK_EQUALS:    onActionExit(); break;
             }
-        } else if (event.type == SDL_JOYBUTTONDOWN) {
-            // Joy-Con Buttons
-            // 0: A, 1: B, 2: X, 3: Y, 10: Plus, 11: Minus
+        }
+        // Nintendo Switch Joy-Con & Pro Controller mapping
+        else if (event.type == SDL_JOYBUTTONDOWN) {
+            std::cout << "[Input] JoyButtonDown: " << static_cast<int>(event.jbutton.button) << std::endl;
             switch (event.jbutton.button) {
-                case 0: // A (Confirm)
-                    if (m_state == UiState::CATALOG && !m_items.empty()) {
-                        int idx = m_page * (m_gridCols * m_gridRows) + m_selectedGridIndex;
-                        if (idx < static_cast<int>(m_items.size())) {
-                            auto catAddon = m_addonManager.getCatalogAddon(m_contentType);
-                            if (catAddon) {
-                                auto fullMeta = StremioClient::fetchMeta(*catAddon, m_contentType, m_items[idx].id);
-                                m_selectedMeta = fullMeta ? *fullMeta : m_items[idx];
-                            }
-                            m_state = UiState::DETAILS;
-                        }
-                    } else if (m_state == UiState::DETAILS) {
-                        m_availableStreams = m_addonManager.aggregateStreams(m_selectedMeta.type, m_selectedMeta.id);
-                        m_selectedStreamIndex = 0;
-                        m_state = UiState::STREAMS;
-                    } else if (m_state == UiState::STREAMS && !m_availableStreams.empty()) {
-                        playStream(m_availableStreams[m_selectedStreamIndex]);
-                    } else if (m_state == UiState::ADDONS) {
-                        const auto& addons = m_addonManager.getAddons();
-                        if (m_selectedAddonIndex < static_cast<int>(addons.size())) {
-                            m_addonManager.setAddonEnabled(addons[m_selectedAddonIndex].url, !addons[m_selectedAddonIndex].enabled);
-                        }
+                case 0:  // A
+                    onActionConfirm(); break;
+                case 1:  // B
+                    onActionBack(); break;
+                case 2:  // X
+                    onActionSearch(); break;
+                case 3:  // Y
+                    onActionToggleType(); break;
+                case 6:  // L
+                    onPagePrev(); break;
+                case 7:  // R
+                    onPageNext(); break;
+                case 10: // Plus
+                    onActionExit(); break;
+                case 11: // Minus
+                    onActionMenu(); break;
+                case 12: // D-Pad Left
+                case 16: // Left Stick Left
+                    onNavigateLeft(); break;
+                case 13: // D-Pad Up
+                case 17: // Left Stick Up
+                    onNavigateUp(); break;
+                case 14: // D-Pad Right
+                case 18: // Left Stick Right
+                    onNavigateRight(); break;
+                case 15: // D-Pad Down
+                case 19: // Left Stick Down
+                    onNavigateDown(); break;
+            }
+        }
+        // D-Pad Hat Motion (Third-party & Pro controllers)
+        else if (event.type == SDL_JOYHATMOTION) {
+            if (event.jhat.value & SDL_HAT_LEFT)  onNavigateLeft();
+            if (event.jhat.value & SDL_HAT_RIGHT) onNavigateRight();
+            if (event.jhat.value & SDL_HAT_UP)    onNavigateUp();
+            if (event.jhat.value & SDL_HAT_DOWN)  onNavigateDown();
+        }
+        // Analog Stick Axes Motion
+        else if (event.type == SDL_JOYAXISMOTION) {
+            uint32_t now = SDL_GetTicks();
+            if (now - m_lastStickNavTime > 220) { // 220ms debounce
+                if (event.jaxis.axis == 0) { // X Axis
+                    if (event.jaxis.value < -16000) {
+                        onNavigateLeft();
+                        m_lastStickNavTime = now;
+                    } else if (event.jaxis.value > 16000) {
+                        onNavigateRight();
+                        m_lastStickNavTime = now;
                     }
-                    break;
-
-                case 1: // B (Back)
-                    if (m_state == UiState::DETAILS || m_state == UiState::ADDONS) {
-                        m_state = UiState::CATALOG;
-                    } else if (m_state == UiState::STREAMS) {
-                        m_state = UiState::DETAILS;
+                } else if (event.jaxis.axis == 1) { // Y Axis
+                    if (event.jaxis.value < -16000) {
+                        onNavigateUp();
+                        m_lastStickNavTime = now;
+                    } else if (event.jaxis.value > 16000) {
+                        onNavigateDown();
+                        m_lastStickNavTime = now;
                     }
-                    break;
-
-                case 2: // X (Search or Add Addon)
-                    if (m_state == UiState::ADDONS) {
-                        openAddAddon();
-                    } else {
-                        openSearch();
-                    }
-                    break;
-
-                case 3: // Y (Toggle Movies / Series)
-                    m_contentType = (m_contentType == "movie") ? "series" : "movie";
-                    loadCatalogData();
-                    break;
-
-                case 10: // Plus (Exit)
-                    m_running = false;
-                    break;
-
-                case 11: // Minus (Addons menu)
-                    m_state = (m_state == UiState::ADDONS) ? UiState::CATALOG : UiState::ADDONS;
-                    break;
+                }
             }
         }
     }
 }
 
 void UiEngine::update() {
+    // Process downloaded poster textures onto the GPU surface
+    processDownloadedPosters();
+
     if (m_state == UiState::PLAYER && m_showOsd) {
         if (SDL_GetTicks() - m_lastPlayerInputTime > 4000) {
             m_showOsd = false;
