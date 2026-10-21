@@ -3,6 +3,7 @@
 #include <iostream>
 #include <sstream>
 #include <iomanip>
+#include <cstring>
 
 #ifdef __SWITCH__
 #include <switch.h>
@@ -12,11 +13,17 @@ namespace Stremio {
 
 static bool s_networkInitialized = false;
 
+static const char* kDefaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 JoyStream/0.1";
+
 static size_t curlWriteCallback(void* contents, size_t size, size_t nmemb, void* userp) {
     size_t totalSize = size * nmemb;
     std::string* mem = static_cast<std::string*>(userp);
     mem->append(static_cast<char*>(contents), totalSize);
     return totalSize;
+}
+
+static size_t curlDiscardCallback(void* contents, size_t size, size_t nmemb, void* userp) {
+    return size * nmemb;
 }
 
 bool HttpClient::initializeNetwork() {
@@ -25,8 +32,14 @@ bool HttpClient::initializeNetwork() {
 #ifdef __SWITCH__
     Result rc = socketInitializeDefault();
     if (R_FAILED(rc)) {
-        std::cerr << "Failed to initialize switch socket service: 0x" << std::hex << rc << std::endl;
+        std::cerr << "[Network] Failed to initialize switch socket service: 0x" << std::hex << rc << std::endl;
         return false;
+    }
+    rc = sslInitialize(0x3);
+    if (R_FAILED(rc)) {
+        std::cerr << "[Network] Warning: Failed to initialize switch ssl service: 0x" << std::hex << rc << std::endl;
+    } else {
+        std::cout << "[Network] Switch SSL service initialized successfully." << std::endl;
     }
 #endif
 
@@ -41,6 +54,7 @@ void HttpClient::cleanupNetwork() {
     curl_global_cleanup();
 
 #ifdef __SWITCH__
+    sslExit();
     socketExit();
 #endif
 
@@ -71,10 +85,10 @@ HttpResponse HttpClient::get(const std::string& url,
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curlWriteCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response.body);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
+    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 10L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeoutSeconds);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "JoyStream/0.1 (Nintendo Switch)");
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, kDefaultUserAgent);
 
     // On Switch homebrew, cert bundles may be missing or system clocks skewed by emuMMC
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
@@ -101,6 +115,70 @@ HttpResponse HttpClient::get(const std::string& url,
     curl_easy_cleanup(curl);
 
     return response;
+}
+
+std::string HttpClient::resolveStreamUrl(const std::string& url,
+                                         const std::map<std::string, std::string>& headers,
+                                         long timeoutSeconds) {
+    if (url.empty()) return url;
+    if (!s_networkInitialized) {
+        initializeNetwork();
+    }
+
+    CURL* curl = curl_easy_init();
+    if (!curl) return url;
+
+    struct curl_slist* chunk = nullptr;
+    for (const auto& [key, val] : headers) {
+        std::string headerStr = key + ": " + val;
+        chunk = curl_slist_append(chunk, headerStr.c_str());
+    }
+
+    // Try a fast HEAD request first to resolve location redirects
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 10L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeoutSeconds);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 6L);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, kDefaultUserAgent);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+
+    if (chunk) {
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, chunk);
+    }
+
+    CURLcode res = curl_easy_perform(curl);
+    char* effUrl = nullptr;
+    if (res == CURLE_OK) {
+        curl_easy_getinfo(curl, CURLINFO_EFFECTIVE_URL, &effUrl);
+        if (effUrl && strlen(effUrl) > 0) {
+            std::string resolved(effUrl);
+            if (chunk) curl_slist_free_all(chunk);
+            curl_easy_cleanup(curl);
+            return resolved;
+        }
+    }
+
+    // If HEAD failed (some CDNs reject HEAD), try GET with a tiny byte-range to grab the redirect target
+    curl_easy_setopt(curl, CURLOPT_NOBODY, 0L);
+    curl_easy_setopt(curl, CURLOPT_RANGE, "0-1024");
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curlDiscardCallback);
+    res = curl_easy_perform(curl);
+    if (res == CURLE_OK) {
+        curl_easy_getinfo(curl, CURLINFO_EFFECTIVE_URL, &effUrl);
+        if (effUrl && strlen(effUrl) > 0) {
+            std::string resolved(effUrl);
+            if (chunk) curl_slist_free_all(chunk);
+            curl_easy_cleanup(curl);
+            return resolved;
+        }
+    }
+
+    if (chunk) curl_slist_free_all(chunk);
+    curl_easy_cleanup(curl);
+    return url;
 }
 
 std::string HttpClient::urlEncode(const std::string& value) {

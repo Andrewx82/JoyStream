@@ -87,6 +87,8 @@ private:
     void clearSearch();
     void setSearchTab(int tab);
     void openAddAddon();
+    void openEditAddon(int index);
+    void removeAddonAt(int index);
     void playStream(const StreamItem& stream);
     void changeSetting(int delta);
     void applySettingsToPlayer();

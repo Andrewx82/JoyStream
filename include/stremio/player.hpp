@@ -63,6 +63,7 @@ private:
     mpv_handle* m_mpv = nullptr;
     mpv_render_context* m_mpvRenderCtx = nullptr;
     PlaybackState m_state;
+    std::string m_lastMpvLogMessage;
     bool m_needsRedraw = false;
 };
 

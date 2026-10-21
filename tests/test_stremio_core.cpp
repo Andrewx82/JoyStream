@@ -100,7 +100,12 @@ void runTests() {
     assert(manager2.getFilterConfig().customExcludeRegex == R"(\b(cam|screener|ts)\b)");
     std::cout << "  Loaded " << manager2.getAddons().size() << " addons from saved file." << std::endl;
     std::cout << "  Filter config preserved: mode=" << StreamFilter::getModeName(manager2.getFilterConfig().mode) << std::endl;
-    std::cout << "  PASS: Config loaded and saved cleanly with FilterConfig." << std::endl;
+
+    // Test editing addon URL
+    manager2.addAddon("https://v3-cinemeta.strem.io");
+    bool editOk = manager2.updateAddonUrl("https://v3-cinemeta.strem.io", "https://v3-cinemeta.strem.io/manifest.json");
+    assert(editOk);
+    std::cout << "  PASS: Config loaded and saved cleanly with FilterConfig and updateAddonUrl." << std::endl;
 
     // Test 7: Stream Filter Engine & Presets
     std::cout << "\n[TEST 7] Stream Filter Engine & Switch Optimization..." << std::endl;

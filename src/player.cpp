@@ -25,8 +25,11 @@ bool VideoPlayer::initialize() {
     // Disable TLS verification so HTTPS streams (Real-Debrid, Torrentio, CDNs) can connect.
     mpv_set_option_string(m_mpv, "tls-verify", "no");
 
+    // Pass FFmpeg lavf options for TLS and network streaming reconnects
+    mpv_set_option_string(m_mpv, "stream-lavf-o", "tls_verify=0,reconnect=1,reconnect_streamed=1,reconnect_delay_max=5");
+
     // Browser User-Agent prevents streaming hosts & Debrid CDNs from blocking connections
-    mpv_set_option_string(m_mpv, "user-agent", "Mozilla/5.0 (Nintendo Switch; ShareApplet) JoyStream/0.1");
+    mpv_set_option_string(m_mpv, "user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 JoyStream/0.1");
 
     // Video Output: Use libmpv rendering backend for mpv_render_context
     mpv_set_option_string(m_mpv, "vo", "libmpv");
@@ -111,14 +114,14 @@ bool VideoPlayer::play(const std::string& url, const std::string& title, const s
     m_state.currentTime = 0.0;
     m_state.duration = 0.0;
     m_state.errorMessage = "";
+    m_lastMpvLogMessage.clear();
     m_needsRedraw = true;
 
     // Set custom headers if provided
     if (!headers.empty()) {
         std::string headerList;
         for (const auto& h : headers) {
-            if (!headerList.empty()) headerList += ",";
-            headerList += h;
+            headerList += h + "\r\n";
         }
         mpv_set_option_string(m_mpv, "http-header-fields", headerList.c_str());
     }
@@ -251,8 +254,15 @@ void VideoPlayer::update() {
         switch (event->event_id) {
             case MPV_EVENT_LOG_MESSAGE: {
                 auto* msg = static_cast<mpv_event_log_message*>(event->data);
-                if (msg && (msg->log_level >= MPV_LOG_LEVEL_WARN || std::string(msg->prefix) == "cplayer" || std::string(msg->prefix) == "ffmpeg")) {
-                    std::cout << "[mpv " << msg->prefix << "] " << msg->text;
+                if (msg) {
+                    if (msg->log_level >= MPV_LOG_LEVEL_WARN || std::string(msg->prefix) == "cplayer" || std::string(msg->prefix) == "ffmpeg" || std::string(msg->prefix) == "tls") {
+                        std::cout << "[mpv " << msg->prefix << "] " << msg->text;
+                        std::string t = msg->text;
+                        while (!t.empty() && (t.back() == '\n' || t.back() == '\r')) t.pop_back();
+                        if (!t.empty() && t.find("Exiting") == std::string::npos && t.find("cplayer") == std::string::npos) {
+                            m_lastMpvLogMessage = t;
+                        }
+                    }
                 }
                 break;
             }
@@ -293,7 +303,12 @@ void VideoPlayer::update() {
             case MPV_EVENT_END_FILE: {
                 auto* endFile = static_cast<mpv_event_end_file*>(event->data);
                 if (endFile && endFile->reason == MPV_END_FILE_REASON_ERROR) {
-                    m_state.errorMessage = mpv_error_string(endFile->error);
+                    std::string errStr = mpv_error_string(endFile->error);
+                    if (!m_lastMpvLogMessage.empty()) {
+                        m_state.errorMessage = errStr + " (" + m_lastMpvLogMessage + ")";
+                    } else {
+                        m_state.errorMessage = errStr;
+                    }
                     std::cerr << "[Playback] Playback failed: " << m_state.errorMessage << std::endl;
                 }
                 m_state.isPlaying = false;

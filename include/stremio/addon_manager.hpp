@@ -36,6 +36,9 @@ public:
     // Add a new addon by URL (fetches manifest and adds if valid)
     bool addAddon(const std::string& url);
 
+    // Edit an existing addon's URL (re-fetches manifest and updates config)
+    bool updateAddonUrl(const std::string& oldUrl, const std::string& newUrl);
+
     // Remove an addon by URL or ID
     bool removeAddon(const std::string& idOrUrl);
 

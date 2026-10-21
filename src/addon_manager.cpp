@@ -158,6 +158,31 @@ bool AddonManager::addAddon(const std::string& url) {
     return true;
 }
 
+bool AddonManager::updateAddonUrl(const std::string& oldUrl, const std::string& newUrl) {
+    std::string cleanOldUrl = StremioClient::normalizeAddonUrl(oldUrl);
+    std::string cleanNewUrl = StremioClient::normalizeAddonUrl(newUrl);
+
+    if (cleanNewUrl.empty()) return false;
+
+    auto manifestOpt = StremioClient::fetchManifest(cleanNewUrl);
+    if (!manifestOpt) {
+        std::cerr << "[AddonManager] Could not fetch manifest for updated URL: " << cleanNewUrl << std::endl;
+        return false;
+    }
+
+    for (auto& a : m_addons) {
+        if (a.url == cleanOldUrl || a.url == oldUrl) {
+            a.url = cleanNewUrl;
+            a.manifest = *manifestOpt;
+            saveConfig();
+            std::cout << "[AddonManager] Successfully updated addon URL to: " << cleanNewUrl << std::endl;
+            return true;
+        }
+    }
+
+    return false;
+}
+
 bool AddonManager::removeAddon(const std::string& idOrUrl) {
     auto it = std::remove_if(m_addons.begin(), m_addons.end(), [&](const InstalledAddon& a) {
         return a.url == idOrUrl || a.manifest.id == idOrUrl;

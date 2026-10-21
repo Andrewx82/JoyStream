@@ -494,7 +494,7 @@ void UiEngine::drawFooter() {
     } else if (m_state == UiState::STREAMS) {
         hints = "(D-Pad / Touch) Select   (A) Play   (Y) Cycle Filter   (X) Edit Regex   (B) Back";
     } else if (m_state == UiState::ADDONS) {
-        hints = "(Touch or D-Pad) Toggle   (X) Add New Addon   (B) Back";
+        hints = "(Touch or D-Pad) Select   (A) Toggle Enabled   (Y) Edit URL   (X) Add New Addon   (B) Back";
     } else if (m_state == UiState::PLAYER) {
         hints = "(Touch / A) Play/Pause   (D-Pad Left/Right) Seek 10s   (Touch Bar) Scrub   (B) Stop";
     }
@@ -963,27 +963,58 @@ void UiEngine::renderAddons() {
     }
 
     int startY = 160;
-    int itemH = 60;
+    int itemH = 68;
     for (size_t i = 0; i < addons.size(); ++i) {
         int y = startY + static_cast<int>(i) * itemH;
         bool isSelected = (static_cast<int>(i) == m_selectedAddonIndex);
 
-        drawRect(70, y, 1140, itemH - 10, isSelected ? SDL_Color{35, 42, 65, 255} : SDL_Color{28, 32, 45, 255});
+        drawRect(70, y, 1140, itemH - 8, isSelected ? SDL_Color{35, 42, 65, 255} : SDL_Color{28, 32, 45, 255});
 
         if (isSelected) {
-            drawRect(68, y - 2, 1144, itemH - 6, {0, 212, 255, 255}, false);
+            drawRect(68, y - 2, 1144, itemH - 4, {0, 212, 255, 255}, false);
         }
 
-        drawText(addons[i].manifest.name, 90, y + 8, {255, 255, 255, 255}, 20);
-        drawText(addons[i].manifest.description, 90, y + 30, {150, 155, 175, 255}, 14);
+        // Name & Version
+        std::string nameVer = addons[i].manifest.name;
+        if (!addons[i].manifest.version.empty()) {
+            nameVer += " v" + addons[i].manifest.version;
+        }
+        drawText(nameVer, 90, y + 8, {255, 255, 255, 255}, 20);
 
-        // Status badge
+        // URL (truncated if long)
+        std::string urlDisplay = addons[i].url;
+        if (urlDisplay.length() > 62) {
+            urlDisplay = urlDisplay.substr(0, 60) + "..";
+        }
+        drawText(urlDisplay, 90, y + 34, {130, 150, 185, 255}, 14);
+
+        // Edit URL Button (Touch / Y)
+        int editBtnX = 810;
+        int editBtnY = y + 14;
+        int editBtnW = 120;
+        int editBtnH = 32;
+        drawRect(editBtnX, editBtnY, editBtnW, editBtnH, {109, 93, 252, 255});
+        drawCenteredText("EDIT URL (Y)", editBtnX, editBtnY, editBtnW, editBtnH, {255, 255, 255, 255}, 14);
+
+        // Delete Button
+        int delBtnX = 940;
+        int delBtnY = y + 14;
+        int delBtnW = 90;
+        int delBtnH = 32;
+        drawRect(delBtnX, delBtnY, delBtnW, delBtnH, {80, 35, 45, 255});
+        drawCenteredText("DELETE", delBtnX, delBtnY, delBtnW, delBtnH, {255, 140, 140, 255}, 14);
+
+        // Status badge / Toggle (Touch / A)
+        int statBtnX = 1040;
+        int statBtnY = y + 14;
+        int statBtnW = 140;
+        int statBtnH = 32;
         if (addons[i].enabled) {
-            drawRect(1070, y + 10, 110, 30, {40, 120, 60, 255});
-            drawCenteredText("ENABLED", 1070, y + 10, 110, 30, {255, 255, 255, 255}, 14);
+            drawRect(statBtnX, statBtnY, statBtnW, statBtnH, {40, 120, 60, 255});
+            drawCenteredText("ENABLED (A)", statBtnX, statBtnY, statBtnW, statBtnH, {255, 255, 255, 255}, 14);
         } else {
-            drawRect(1070, y + 10, 110, 30, {90, 40, 40, 255});
-            drawCenteredText("DISABLED", 1070, y + 10, 110, 30, {255, 255, 255, 255}, 14);
+            drawRect(statBtnX, statBtnY, statBtnW, statBtnH, {90, 40, 40, 255});
+            drawCenteredText("DISABLED (A)", statBtnX, statBtnY, statBtnW, statBtnH, {255, 255, 255, 255}, 14);
         }
     }
 }
@@ -1124,7 +1155,35 @@ void UiEngine::openAddAddon() {
     std::string url = requestTextInput("Enter Stremio Addon URL", "https://");
     if (!url.empty()) {
         m_addonManager.addAddon(url);
+        loadCatalogData();
     }
+}
+
+void UiEngine::openEditAddon(int index) {
+    const auto& addons = m_addonManager.getAddons();
+    if (index < 0 || index >= static_cast<int>(addons.size())) return;
+
+    std::string currentUrl = addons[index].url;
+    std::string newUrl = requestTextInput("Edit Addon URL", currentUrl);
+    if (!newUrl.empty() && newUrl != currentUrl) {
+        bool ok = m_addonManager.updateAddonUrl(currentUrl, newUrl);
+        if (ok) {
+            std::cout << "[UI] Updated addon at index " << index << " to: " << newUrl << std::endl;
+            loadCatalogData();
+        }
+    }
+}
+
+void UiEngine::removeAddonAt(int index) {
+    const auto& addons = m_addonManager.getAddons();
+    if (index < 0 || index >= static_cast<int>(addons.size())) return;
+
+    std::string url = addons[index].url;
+    m_addonManager.removeAddon(url);
+    if (m_selectedAddonIndex >= static_cast<int>(m_addonManager.getAddons().size())) {
+        m_selectedAddonIndex = std::max(0, static_cast<int>(m_addonManager.getAddons().size()) - 1);
+    }
+    loadCatalogData();
 }
 
 void UiEngine::playStream(const StreamItem& stream) {
@@ -1146,7 +1205,16 @@ void UiEngine::playStream(const StreamItem& stream) {
         applySettingsToPlayer();
     }
 
-    m_player.play(stream.url, m_selectedMeta.name + " (" + stream.name + ")");
+    // Resolve any 301/302 redirects beforehand so libmpv/ffmpeg directly connects to final CDN stream
+    std::string playUrl = HttpClient::resolveStreamUrl(stream.url, stream.headers);
+    std::cout << "[Playback] Resolved stream URL: " << playUrl << std::endl;
+
+    std::vector<std::string> headers;
+    for (const auto& [k, v] : stream.headers) {
+        headers.push_back(k + ": " + v);
+    }
+
+    m_player.play(playUrl, m_selectedMeta.name + " (" + stream.name + ")", headers);
     m_state = UiState::PLAYER;
     m_lastPlayerInputTime = SDL_GetTicks();
     m_showOsd = true;
@@ -1405,14 +1473,33 @@ void UiEngine::handleTouchTap(int x, int y) {
             return;
         }
 
-        // Tapping an addon row to toggle
         const auto& addons = m_addonManager.getAddons();
         int startY = 160;
-        int itemH = 60;
+        int itemH = 68;
         for (size_t i = 0; i < addons.size(); ++i) {
             int itemY = startY + static_cast<int>(i) * itemH;
-            if (x >= 70 && x <= 1210 && y >= itemY && y <= itemY + itemH - 10) {
+            if (x >= 70 && x <= 1210 && y >= itemY && y <= itemY + itemH - 8) {
                 m_selectedAddonIndex = static_cast<int>(i);
+
+                // Edit URL button
+                if (x >= 810 && x <= 930 && y >= itemY + 10 && y <= itemY + 50) {
+                    openEditAddon(static_cast<int>(i));
+                    return;
+                }
+
+                // Delete button
+                if (x >= 940 && x <= 1030 && y >= itemY + 10 && y <= itemY + 50) {
+                    removeAddonAt(static_cast<int>(i));
+                    return;
+                }
+
+                // Enabled / Disabled toggle
+                if (x >= 1040 && x <= 1180 && y >= itemY + 10 && y <= itemY + 50) {
+                    m_addonManager.setAddonEnabled(addons[i].url, !addons[i].enabled);
+                    return;
+                }
+
+                // Tapping elsewhere on the row selects and toggles it
                 m_addonManager.setAddonEnabled(addons[i].url, !addons[i].enabled);
                 return;
             }
@@ -1656,6 +1743,8 @@ void UiEngine::onActionSearch() {
 void UiEngine::onActionToggleType() {
     if (m_state == UiState::STREAMS) {
         cycleFilterMode();
+    } else if (m_state == UiState::ADDONS) {
+        openEditAddon(m_selectedAddonIndex);
     } else if (m_state == UiState::CATALOG) {
         if (m_isSearchActive) {
             setSearchTab((m_searchTab + 1) % 3);
