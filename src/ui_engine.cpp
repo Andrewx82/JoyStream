@@ -2,11 +2,10 @@
 #include "stremio/stremio_client.hpp"
 #include "stremio/http_client.hpp"
 #include <iostream>
-#include <iomanip>
 #include <sstream>
-#include <cmath>
-#include <chrono>
+#include <iomanip>
 #include <algorithm>
+#include <cmath>
 
 #ifdef __SWITCH__
 #include <switch.h>
@@ -95,6 +94,9 @@ bool UiEngine::initialize() {
         return false;
     }
 
+    // Create streaming texture for hardware/software video playback rendering
+    m_videoTexture = SDL_CreateTexture(m_renderer, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING, 1280, 720);
+
     // Set 5 cols x 2 rows
     m_gridCols = 5;
     m_gridRows = 2;
@@ -135,12 +137,15 @@ bool UiEngine::initialize() {
               << " medium=" << (m_fontMedium != nullptr)
               << " large=" << (m_fontLarge != nullptr) << std::endl;
 
-    // Load installed addons & filter settings
-    std::cout << "[Config] Loading addon configurations..." << std::endl;
+    // Load installed addons, filter settings & app settings
+    std::cout << "[Config] Loading addon configurations & settings..." << std::endl;
     m_addonManager.loadConfig();
     m_filterConfig = m_addonManager.getFilterConfig();
+    m_settings = m_addonManager.getSettings();
     std::cout << "[Config] Active addons: " << m_addonManager.getAddons().size()
               << " Filter: " << StreamFilter::getModeName(m_filterConfig.mode) << std::endl;
+
+    applySettingsToPlayer();
 
     // Start background image loader thread
     m_imageThreadRunning = true;
@@ -161,6 +166,11 @@ void UiEngine::shutdown() {
 
     m_player.shutdown();
 
+    if (m_videoTexture) {
+        SDL_DestroyTexture(m_videoTexture);
+        m_videoTexture = nullptr;
+    }
+
     // Destroy cached textures
     for (auto& [url, tex] : m_posterTextures) {
         if (tex) SDL_DestroyTexture(tex);
@@ -176,8 +186,8 @@ void UiEngine::shutdown() {
     plExit();
 #endif
 
-    IMG_Quit();
     TTF_Quit();
+    IMG_Quit();
 
     if (m_renderer) {
         SDL_DestroyRenderer(m_renderer);
@@ -188,6 +198,15 @@ void UiEngine::shutdown() {
         m_window = nullptr;
     }
     SDL_Quit();
+}
+
+void UiEngine::applySettingsToPlayer() {
+    m_player.setHwDec(m_settings.hwdecEnabled);
+    m_player.setAudioLanguage(m_settings.audioLanguage);
+    m_player.setSubtitlesEnabled(m_settings.subtitlesEnabled);
+    m_player.setSubtitleLanguage(m_settings.subtitleLanguage);
+    m_player.setDemuxerMaxBytes(m_settings.bufferCacheSize);
+    m_player.setNetworkTimeout(m_settings.networkTimeoutSeconds);
 }
 
 void UiEngine::posterDownloaderWorker() {
@@ -251,14 +270,31 @@ void UiEngine::processDownloadedPosters() {
 }
 
 void UiEngine::loadCatalogData() {
+    if (m_isSearchActive) return;
+
     m_isLoading = true;
     m_items.clear();
 
     try {
         auto catalogAddon = m_addonManager.getCatalogAddon(m_contentType);
         if (catalogAddon) {
-            std::cout << "[Catalog] Requesting " << m_contentType << " from " << catalogAddon->name << "..." << std::endl;
-            m_items = StremioClient::fetchCatalog(*catalogAddon, m_contentType, "top");
+            std::string catId = "top";
+            std::map<std::string, std::string> extras;
+
+            if (m_selectedCategoryIndex == 0) {
+                catId = "top"; // Popular
+            } else if (m_selectedCategoryIndex == 1) {
+                catId = "imdbRating"; // Top Rated
+            } else if (m_selectedCategoryIndex == 2) {
+                catId = "year"; // New Releases
+            } else if (m_selectedCategoryIndex < static_cast<int>(m_categories.size())) {
+                catId = "top";
+                extras["genre"] = m_categories[m_selectedCategoryIndex];
+            }
+
+            std::cout << "[Catalog] Requesting " << m_contentType
+                      << " (Cat: " << m_categories[m_selectedCategoryIndex] << ") from " << catalogAddon->name << "..." << std::endl;
+            m_items = StremioClient::fetchCatalog(*catalogAddon, m_contentType, catId, extras);
             std::cout << "[Catalog] Received " << m_items.size() << " items." << std::endl;
         } else {
             std::cerr << "[Catalog] No catalog addon active for type " << m_contentType << std::endl;
@@ -291,9 +327,8 @@ void UiEngine::drawText(const std::string& text, int x, int y, SDL_Color color, 
     if (!m_renderer || text.empty()) return;
 
     TTF_Font* font = m_fontMedium;
-    if (fontSize <= 18) font = m_fontSmall;
-    else if (fontSize >= 28) font = m_fontLarge;
-
+    if (fontSize <= 17 && m_fontSmall) font = m_fontSmall;
+    else if (fontSize >= 26 && m_fontLarge) font = m_fontLarge;
     if (!font) return;
 
     SDL_Surface* surface = TTF_RenderUTF8_Blended(font, text.c_str(), color);
@@ -301,8 +336,8 @@ void UiEngine::drawText(const std::string& text, int x, int y, SDL_Color color, 
 
     SDL_Texture* texture = SDL_CreateTextureFromSurface(m_renderer, surface);
     if (texture) {
-        int textX = rightAlign ? (x - surface->w) : x;
-        SDL_Rect dst = {textX, y, surface->w, surface->h};
+        int finalX = rightAlign ? (x - surface->w) : x;
+        SDL_Rect dst = {finalX, y, surface->w, surface->h};
         SDL_RenderCopy(m_renderer, texture, nullptr, &dst);
         SDL_DestroyTexture(texture);
     }
@@ -313,9 +348,8 @@ void UiEngine::drawCenteredText(const std::string& text, int x, int y, int w, in
     if (!m_renderer || text.empty()) return;
 
     TTF_Font* font = m_fontMedium;
-    if (fontSize <= 18) font = m_fontSmall;
-    else if (fontSize >= 28) font = m_fontLarge;
-
+    if (fontSize <= 17 && m_fontSmall) font = m_fontSmall;
+    else if (fontSize >= 26 && m_fontLarge) font = m_fontLarge;
     if (!font) return;
 
     SDL_Surface* surface = TTF_RenderUTF8_Blended(font, text.c_str(), color);
@@ -323,9 +357,7 @@ void UiEngine::drawCenteredText(const std::string& text, int x, int y, int w, in
 
     SDL_Texture* texture = SDL_CreateTextureFromSurface(m_renderer, surface);
     if (texture) {
-        int textX = x + (w - surface->w) / 2;
-        int textY = y + (h - surface->h) / 2;
-        SDL_Rect dst = {textX, textY, surface->w, surface->h};
+        SDL_Rect dst = {x + (w - surface->w) / 2, y + (h - surface->h) / 2, surface->w, surface->h};
         SDL_RenderCopy(m_renderer, texture, nullptr, &dst);
         SDL_DestroyTexture(texture);
     }
@@ -357,30 +389,89 @@ void UiEngine::drawHeader() {
     drawRect(0, 0, 1280, 70, {18, 20, 29, 255});
     drawRect(0, 68, 1280, 2, {50, 54, 75, 255});
 
-    // Logo
-    drawText("JOYSTREAM", 40, 18, {109, 93, 252, 255}, 32);
+    if (!m_isSearchActive) {
+        // Logo
+        drawText("JOYSTREAM", 30, 18, {109, 93, 252, 255}, 30);
+        // Neon dots for Joy-Con flavor
+        drawRect(205, 24, 6, 24, {0, 212, 255, 255});
+        drawRect(214, 24, 6, 24, {255, 60, 40, 255});
 
-    // Clickable Tabs
-    bool isMovie = (m_contentType == "movie");
-    SDL_Color movieColor = isMovie ? SDL_Color{0, 212, 255, 255} : SDL_Color{140, 145, 170, 255};
-    SDL_Color seriesColor = !isMovie ? SDL_Color{0, 212, 255, 255} : SDL_Color{140, 145, 170, 255};
+        // Movies & Series Toggle Tabs
+        bool isMovie = (m_contentType == "movie");
+        SDL_Color movieColor = isMovie ? SDL_Color{0, 212, 255, 255} : SDL_Color{140, 145, 170, 255};
+        SDL_Color seriesColor = !isMovie ? SDL_Color{0, 212, 255, 255} : SDL_Color{140, 145, 170, 255};
 
-    drawRect(290, 16, 120, 38, isMovie ? SDL_Color{35, 42, 65, 255} : SDL_Color{22, 25, 36, 255});
-    drawCenteredText("Movies", 290, 16, 120, 38, movieColor, 20);
+        drawRect(235, 16, 95, 38, isMovie ? SDL_Color{35, 42, 65, 255} : SDL_Color{22, 25, 36, 255});
+        drawCenteredText("Movies", 235, 16, 95, 38, movieColor, 18);
 
-    drawRect(420, 16, 120, 38, !isMovie ? SDL_Color{35, 42, 65, 255} : SDL_Color{22, 25, 36, 255});
-    drawCenteredText("Series", 420, 16, 120, 38, seriesColor, 20);
+        drawRect(340, 16, 95, 38, !isMovie ? SDL_Color{35, 42, 65, 255} : SDL_Color{22, 25, 36, 255});
+        drawCenteredText("Series", 340, 16, 95, 38, seriesColor, 18);
 
-    // Page indicator
-    int itemsPerPage = m_gridCols * m_gridRows;
-    int totalPages = std::max(1, static_cast<int>(std::ceil(static_cast<double>(m_items.size()) / itemsPerPage)));
-    std::string pageInfo = "◀  Page " + std::to_string(m_page + 1) + " / " + std::to_string(totalPages) + "  ▶";
-    drawText(pageInfo, 820, 24, {180, 185, 205, 255}, 18);
+        // Category Selector Pill
+        int catX = 445;
+        int catW = 200;
+        drawRect(catX, 16, catW, 38, {30, 36, 54, 255});
+        drawRect(catX, 16, catW, 38, {65, 75, 110, 255}, false);
+        std::string catLabel = m_categories[m_selectedCategoryIndex] + "  ▼";
+        if (catLabel.length() > 18) catLabel = catLabel.substr(0, 16) + "..";
+        drawCenteredText(catLabel, catX, 16, catW, 38, {0, 212, 255, 255}, 16);
 
-    // Addons Button
-    drawRect(1080, 16, 160, 38, {30, 35, 52, 255});
-    std::string addonInfo = std::to_string(m_addonManager.getAddons().size()) + " Addons (-)";
-    drawCenteredText(addonInfo, 1080, 16, 160, 38, {200, 205, 230, 255}, 18);
+        // Page indicator
+        int itemsPerPage = m_gridCols * m_gridRows;
+        int totalPages = std::max(1, static_cast<int>(std::ceil(static_cast<double>(m_items.size()) / itemsPerPage)));
+        std::string pageInfo = "◀ " + std::to_string(m_page + 1) + "/" + std::to_string(totalPages) + " ▶";
+        drawCenteredText(pageInfo, 660, 16, 120, 38, {180, 185, 205, 255}, 16);
+
+        // Settings Button
+        bool isSettings = (m_state == UiState::SETTINGS);
+        drawRect(790, 16, 140, 38, isSettings ? SDL_Color{50, 60, 90, 255} : SDL_Color{28, 33, 48, 255});
+        drawCenteredText("Settings (-)", 790, 16, 140, 38, isSettings ? SDL_Color{0, 212, 255, 255} : SDL_Color{200, 205, 225, 255}, 16);
+
+        // Addons Button
+        bool isAddons = (m_state == UiState::ADDONS);
+        drawRect(940, 16, 120, 38, isAddons ? SDL_Color{50, 60, 90, 255} : SDL_Color{28, 33, 48, 255});
+        std::string addonInfo = std::to_string(m_addonManager.getAddons().size()) + " Addons";
+        drawCenteredText(addonInfo, 940, 16, 120, 38, isAddons ? SDL_Color{0, 212, 255, 255} : SDL_Color{200, 205, 225, 255}, 16);
+
+        // Search Button (X)
+        drawRect(1070, 16, 180, 38, {109, 93, 252, 255});
+        drawCenteredText("Search (X)", 1070, 16, 180, 38, {255, 255, 255, 255}, 18);
+    } else {
+        // Search Banner
+        std::string searchDisplay = "Search: \"" + (m_searchQuery.length() > 14 ? m_searchQuery.substr(0, 12) + ".." : m_searchQuery) + "\"";
+        drawText(searchDisplay, 30, 22, {255, 255, 255, 255}, 20);
+
+        // Search Tabs: [ ALL ] [ MOVIES ] [ TV SHOWS ]
+        auto drawSearchTab = [&](int tabIdx, int x, int w, const std::string& label, size_t count) {
+            bool active = (m_searchTab == tabIdx);
+            drawRect(x, 16, w, 38, active ? SDL_Color{40, 70, 120, 255} : SDL_Color{24, 28, 40, 255});
+            if (active) drawRect(x, 16, w, 38, {0, 212, 255, 255}, false);
+            std::string t = label + " (" + std::to_string(count) + ")";
+            drawCenteredText(t, x, 16, w, 38, active ? SDL_Color{0, 212, 255, 255} : SDL_Color{160, 165, 185, 255}, 15);
+        };
+
+        drawSearchTab(0, 320, 120, "All", m_searchAllResults.size());
+        drawSearchTab(1, 450, 140, "Movies", m_searchMovieResults.size());
+        drawSearchTab(2, 600, 150, "TV Shows", m_searchSeriesResults.size());
+
+        // Clear Search Button
+        drawRect(760, 16, 110, 38, {60, 35, 45, 255});
+        drawCenteredText("✕ Clear", 760, 16, 110, 38, {255, 140, 140, 255}, 16);
+
+        // Page indicator
+        int itemsPerPage = m_gridCols * m_gridRows;
+        int totalPages = std::max(1, static_cast<int>(std::ceil(static_cast<double>(m_items.size()) / itemsPerPage)));
+        std::string pageInfo = "◀ " + std::to_string(m_page + 1) + "/" + std::to_string(totalPages) + " ▶";
+        drawCenteredText(pageInfo, 880, 16, 110, 38, {180, 185, 205, 255}, 15);
+
+        // Settings Button
+        drawRect(1000, 16, 120, 38, {28, 33, 48, 255});
+        drawCenteredText("Settings", 1000, 16, 120, 38, {200, 205, 225, 255}, 16);
+
+        // Addons Button
+        drawRect(1130, 16, 120, 38, {28, 33, 48, 255});
+        drawCenteredText("Addons", 1130, 16, 120, 38, {200, 205, 225, 255}, 16);
+    }
 }
 
 void UiEngine::drawFooter() {
@@ -389,11 +480,19 @@ void UiEngine::drawFooter() {
 
     std::string hints;
     if (m_state == UiState::CATALOG) {
-        hints = "(Touch or D-Pad) Select   (A) Details   (L/R) Page   (X) Search   (Y) Type   (-) Addons";
+        if (m_isSearchActive) {
+            hints = "(Touch or D-Pad) Select   (A) Details   (L/R) Switch Tab   (X) New Search   (B) Clear Search";
+        } else {
+            hints = "(Touch or D-Pad) Select   (A) Details   (L/R) Page   (X) Search   (Y) Type   (ZL) Categories   (-) Settings";
+        }
+    } else if (m_state == UiState::CATEGORIES_MODAL) {
+        hints = "(D-Pad or Touch) Choose Category   (A) Confirm   (B) Close";
+    } else if (m_state == UiState::SETTINGS) {
+        hints = "(D-Pad Up/Down) Select   (Left/Right or A) Change Value   (B) Back to Catalog";
     } else if (m_state == UiState::DETAILS) {
         hints = "(A / Touch) Watch Streams   (B) Back to Catalog";
     } else if (m_state == UiState::STREAMS) {
-        hints = "(Touch or D-Pad) Select Stream   (A) Play   (B) Cancel";
+        hints = "(D-Pad / Touch) Select   (A) Play   (Y) Cycle Filter   (X) Edit Regex   (B) Back";
     } else if (m_state == UiState::ADDONS) {
         hints = "(Touch or D-Pad) Toggle   (X) Add New Addon   (B) Back";
     } else if (m_state == UiState::PLAYER) {
@@ -411,8 +510,13 @@ void UiEngine::renderCatalog() {
     }
 
     if (m_items.empty()) {
-        drawText("No catalog items loaded.", 500, 300, {230, 100, 100, 255}, 24);
-        drawText("Check Wi-Fi connection, or tap (-) to view Addons.", 410, 350, {180, 185, 205, 255}, 20);
+        if (m_isSearchActive) {
+            drawText("No search results found for: " + m_searchQuery, 420, 300, {230, 140, 140, 255}, 22);
+            drawText("Try a different search query or tap ✕ Clear.", 430, 345, {180, 185, 205, 255}, 18);
+        } else {
+            drawText("No items loaded for category: " + m_categories[m_selectedCategoryIndex], 420, 300, {230, 100, 100, 255}, 22);
+            drawText("Check Wi-Fi connection, or tap (-) to view Addons.", 410, 345, {180, 185, 205, 255}, 18);
+        }
         return;
     }
 
@@ -455,14 +559,12 @@ void UiEngine::renderCatalog() {
         int pBoxW = cardW - 20;
         int pBoxH = 180;
 
-        // Poster backdrop box
         drawRect(pBoxX, pBoxY, pBoxW, pBoxH, {16, 18, 25, 255});
 
         bool posterRendered = false;
         if (!item.poster.empty()) {
             auto it = m_posterTextures.find(item.poster);
             if (it != m_posterTextures.end() && it->second) {
-                // Aspect-ratio fitted rendering
                 drawTextureFitted(it->second, pBoxX, pBoxY, pBoxW, pBoxH);
                 posterRendered = true;
             } else {
@@ -544,7 +646,7 @@ void UiEngine::renderDetails() {
         drawText(epCount, 360, 415, {0, 212, 255, 255}, 18);
     }
 
-    // Action Button 1: "▶ WATCH NOW" (wide enough with generous padding)
+    // Action Button 1: "▶ WATCH NOW"
     int btnX = 360;
     int btnY = 475;
     int btnW = 280;
@@ -558,7 +660,7 @@ void UiEngine::renderDetails() {
     }
     drawCenteredText("▶  WATCH NOW", btnX, btnY, btnW, btnH, {255, 255, 255, 255}, 22);
 
-    // Action Button 2: "BACK" (Touch/Clickable)
+    // Action Button 2: "BACK"
     int backBtnX = 660;
     int backBtnY = 475;
     int backBtnW = 150;
@@ -608,6 +710,11 @@ void UiEngine::renderStreams() {
     std::string modeDesc = StreamFilter::getModeDescription(m_filterConfig.mode);
     drawText(modeDesc, mx + 25, my + 56, {150, 155, 180, 255}, 14);
 
+    if (!m_streamErrorMessage.empty()) {
+        drawRect(mx + 20, my + 54, mw - 40, 22, {80, 30, 30, 255});
+        drawText("Notice: " + m_streamErrorMessage, mx + 25, my + 57, {255, 140, 140, 255}, 13);
+    }
+
     if (m_availableStreams.empty()) {
         drawText("No streams match current filter: " + StreamFilter::getModeName(m_filterConfig.mode), mx + 50, my + 130, {230, 130, 130, 255}, 20);
         drawText("Tap or press (Y) to cycle filters, or switch to 'Show All'.", mx + 50, my + 170, {180, 185, 205, 255}, 18);
@@ -650,53 +757,279 @@ void UiEngine::renderStreams() {
     }
 }
 
+void UiEngine::renderCategoriesModal() {
+    drawRect(0, 0, 1280, 720, {10, 10, 15, 220});
+
+    int mw = 840;
+    int mh = 490;
+    int mx = (1280 - mw) / 2;
+    int my = (720 - mh) / 2;
+
+    drawRect(mx, my, mw, mh, {24, 27, 38, 255});
+    drawRect(mx, my, mw, 52, {35, 40, 58, 255});
+
+    drawText("SELECT CATEGORY / GENRE", mx + 25, my + 14, {255, 255, 255, 255}, 22);
+
+    // Close button
+    drawRect(mx + mw - 45, my + 10, 32, 32, {60, 65, 85, 255});
+    drawCenteredText("X", mx + mw - 45, my + 10, 32, 32, {255, 255, 255, 255}, 18);
+
+    int cols = 4;
+    int btnW = 180;
+    int btnH = 68;
+    int gapX = 18;
+    int gapY = 18;
+    int startX = mx + 30;
+    int startY = my + 80;
+
+    for (size_t i = 0; i < m_categories.size() && i < 16; ++i) {
+        int c = static_cast<int>(i) % cols;
+        int r = static_cast<int>(i) / cols;
+        int bx = startX + c * (btnW + gapX);
+        int by = startY + r * (btnH + gapY);
+
+        bool isCurrent = (static_cast<int>(i) == m_selectedCategoryIndex);
+        bool isFocused = (static_cast<int>(i) == m_modalCategoryIndex);
+
+        SDL_Color bg = isCurrent ? SDL_Color{35, 60, 95, 255} : (isFocused ? SDL_Color{48, 54, 78, 255} : SDL_Color{30, 34, 48, 255});
+        drawRect(bx, by, btnW, btnH, bg);
+
+        if (isFocused || isCurrent) {
+            drawRect(bx, by, btnW, btnH, isCurrent ? SDL_Color{0, 212, 255, 255} : SDL_Color{109, 93, 252, 255}, false);
+        }
+
+        drawCenteredText(m_categories[i], bx, by, btnW, btnH, isCurrent ? SDL_Color{0, 212, 255, 255} : SDL_Color{220, 225, 240, 255}, 17);
+    }
+}
+
+void UiEngine::renderSettings() {
+    drawHeader();
+
+    int panelW = 1200;
+    int panelH = 550;
+    int panelX = 40;
+    int panelY = 90;
+
+    drawRect(panelX, panelY, panelW, panelH, {22, 25, 36, 255});
+    drawRect(panelX, panelY, panelW, 50, {32, 38, 56, 255});
+    drawText("SETTINGS", panelX + 30, panelY + 12, {255, 255, 255, 255}, 24);
+
+    // Back button in settings
+    drawRect(panelX + panelW - 130, panelY + 9, 110, 32, {48, 54, 76, 255});
+    drawCenteredText("◀ Back (B)", panelX + panelW - 130, panelY + 9, 110, 32, {200, 205, 225, 255}, 16);
+
+    struct SettingItem {
+        std::string label;
+        std::string value;
+        std::string desc;
+    };
+
+    std::vector<SettingItem> items = {
+        {"Hardware Video Decoding", m_settings.hwdecEnabled ? "Enabled (NVDEC)" : "Disabled (Software)", "Uses Nintendo Switch Tegra X1 NVDEC hardware accelerator for 60fps video."},
+        {"Audio Language Preference", m_settings.audioLanguage, "Preferred audio stream language track (e.g. auto, eng, spa, jpn)."},
+        {"Subtitles", m_settings.subtitlesEnabled ? "Enabled" : "Disabled", "Automatically loads and displays subtitles during stream playback."},
+        {"Subtitle Language", m_settings.subtitleLanguage, "Preferred subtitle language track (e.g. eng, spa, fre, ger)."},
+        {"Demuxer Cache Buffer", m_settings.bufferCacheSize, "RAM memory cache dedicated to buffering streams against Wi-Fi drops."},
+        {"Network Stream Timeout", std::to_string(m_settings.networkTimeoutSeconds) + " Seconds", "Max time before retrying a lagging video stream or slow CDN."},
+        {"Default Stream Filter", StreamFilter::getModeName(m_filterConfig.mode), "Preset used to filter streams (Switch Optimized removes unplayable 4K/AV1/CAM)."},
+        {"Max Stream File Size", m_filterConfig.maxFileSizeGB > 0 ? std::to_string(static_cast<int>(m_filterConfig.maxFileSizeGB)) + " GB" : "Unlimited", "Excludes huge files that cause Wi-Fi buffer under-runs on the Switch."},
+        {"Custom Exclude Regex", m_filterConfig.customExcludeRegex.substr(0, 36) + (m_filterConfig.customExcludeRegex.length() > 36 ? ".." : ""), "Regular expression pattern excluded from stream results (tap to edit)."},
+        {"Clear Poster Cache", "Tap or Press (A)", "Cleans in-memory poster textures to free RAM."},
+        {"Reset All to Defaults", "Tap or Press (A)", "Restores factory default player and stream settings."}
+    };
+
+    int listY = panelY + 58;
+    int rowH = 41;
+    for (size_t i = 0; i < items.size(); ++i) {
+        int ry = listY + static_cast<int>(i) * rowH;
+        bool isSel = (static_cast<int>(i) == m_selectedSettingIndex);
+
+        if (isSel) {
+            drawRect(panelX + 15, ry, panelW - 30, rowH - 4, {45, 52, 78, 255});
+            drawRect(panelX + 15, ry, panelW - 30, rowH - 4, {109, 93, 252, 255}, false);
+        }
+
+        drawText(items[i].label, panelX + 35, ry + 8, isSel ? SDL_Color{0, 212, 255, 255} : SDL_Color{220, 225, 240, 255}, 18);
+
+        // Value button pill
+        int valW = 280;
+        int valH = 30;
+        int valX = panelX + panelW - valW - 35;
+        int valY = ry + 4;
+        drawRect(valX, valY, valW, valH, isSel ? SDL_Color{60, 68, 98, 255} : SDL_Color{35, 40, 56, 255});
+        drawCenteredText(items[i].value, valX, valY, valW, valH, isSel ? SDL_Color{255, 255, 255, 255} : SDL_Color{180, 185, 205, 255}, 16);
+    }
+
+    // Bottom description banner
+    if (m_selectedSettingIndex >= 0 && m_selectedSettingIndex < static_cast<int>(items.size())) {
+        int descY = panelY + panelH - 34;
+        drawRect(panelX + 20, descY, panelW - 40, 26, {18, 20, 28, 200});
+        drawText("ℹ  " + items[m_selectedSettingIndex].desc, panelX + 35, descY + 4, {160, 165, 190, 255}, 15);
+    }
+}
+
+void UiEngine::changeSetting(int delta) {
+    switch (m_selectedSettingIndex) {
+        case 0: // HW Decoding
+            m_settings.hwdecEnabled = !m_settings.hwdecEnabled;
+            break;
+        case 1: { // Audio Language
+            std::vector<std::string> langs = {"auto", "eng", "spa", "fre", "ger", "jpn", "por", "ita"};
+            auto it = std::find(langs.begin(), langs.end(), m_settings.audioLanguage);
+            int idx = (it != langs.end()) ? static_cast<int>(std::distance(langs.begin(), it)) : 0;
+            idx = (idx + delta + static_cast<int>(langs.size())) % static_cast<int>(langs.size());
+            m_settings.audioLanguage = langs[idx];
+            break;
+        }
+        case 2: // Subtitles
+            m_settings.subtitlesEnabled = !m_settings.subtitlesEnabled;
+            break;
+        case 3: { // Subtitle Language
+            std::vector<std::string> langs = {"eng", "spa", "fre", "ger", "jpn", "por", "ita"};
+            auto it = std::find(langs.begin(), langs.end(), m_settings.subtitleLanguage);
+            int idx = (it != langs.end()) ? static_cast<int>(std::distance(langs.begin(), it)) : 0;
+            idx = (idx + delta + static_cast<int>(langs.size())) % static_cast<int>(langs.size());
+            m_settings.subtitleLanguage = langs[idx];
+            break;
+        }
+        case 4: { // Demuxer Buffer Cache
+            std::vector<std::string> sizes = {"64M", "128M", "256M"};
+            auto it = std::find(sizes.begin(), sizes.end(), m_settings.bufferCacheSize);
+            int idx = (it != sizes.end()) ? static_cast<int>(std::distance(sizes.begin(), it)) : 1;
+            idx = (idx + delta + static_cast<int>(sizes.size())) % static_cast<int>(sizes.size());
+            m_settings.bufferCacheSize = sizes[idx];
+            break;
+        }
+        case 5: { // Network Timeout
+            std::vector<int> timeouts = {10, 15, 20, 30};
+            auto it = std::find(timeouts.begin(), timeouts.end(), m_settings.networkTimeoutSeconds);
+            int idx = (it != timeouts.end()) ? static_cast<int>(std::distance(timeouts.begin(), it)) : 2;
+            idx = (idx + delta + static_cast<int>(timeouts.size())) % static_cast<int>(timeouts.size());
+            m_settings.networkTimeoutSeconds = timeouts[idx];
+            break;
+        }
+        case 6: // Filter Mode
+            cycleFilterMode();
+            return;
+        case 7: { // Max File Size
+            std::vector<float> sizes = {10.0f, 15.0f, 25.0f, 0.0f};
+            auto it = std::find(sizes.begin(), sizes.end(), m_filterConfig.maxFileSizeGB);
+            int idx = (it != sizes.end()) ? static_cast<int>(std::distance(sizes.begin(), it)) : 2;
+            idx = (idx + delta + static_cast<int>(sizes.size())) % static_cast<int>(sizes.size());
+            m_filterConfig.maxFileSizeGB = sizes[idx];
+            m_addonManager.setFilterConfig(m_filterConfig);
+            return;
+        }
+        case 8: // Custom Exclude Regex
+            editCustomRegex();
+            return;
+        case 9: { // Clear poster cache
+            for (auto& [url, tex] : m_posterTextures) {
+                if (tex) SDL_DestroyTexture(tex);
+            }
+            m_posterTextures.clear();
+            m_queuedUrls.clear();
+            int itemsPerPage = m_gridCols * m_gridRows;
+            for (int i = 0; i < itemsPerPage && i < static_cast<int>(m_items.size()); ++i) {
+                queuePosterDownload(m_items[i].poster);
+            }
+            break;
+        }
+        case 10: { // Reset All to Defaults
+            m_settings = AppSettings();
+            m_filterConfig = FilterConfig();
+            m_addonManager.setFilterConfig(m_filterConfig);
+            break;
+        }
+    }
+
+    m_addonManager.setSettings(m_settings);
+    applySettingsToPlayer();
+}
+
 void UiEngine::renderAddons() {
     drawRect(40, 90, 1200, 550, {22, 25, 36, 255});
-    drawText("INSTALLED STREMIO ADDONS", 70, 115, {255, 255, 255, 255}, 28);
-    drawText("(Tap or press X to add a custom addon URL, e.g. Torrentio / RealDebrid)", 70, 155, {160, 165, 185, 255}, 18);
+    drawRect(40, 90, 1200, 50, {32, 38, 56, 255});
+    drawText("INSTALLED ADDONS", 70, 102, {255, 255, 255, 255}, 24);
 
-    // "+ Add Addon" touch button
-    int addBtnX = 960;
-    int addBtnY = 110;
-    int addBtnW = 220;
-    int addBtnH = 42;
-    drawRect(addBtnX, addBtnY, addBtnW, addBtnH, {109, 93, 252, 255});
-    drawCenteredText("+ ADD ADDON (X)", addBtnX, addBtnY, addBtnW, addBtnH, {255, 255, 255, 255}, 18);
+    // "+ ADD ADDON" Button
+    drawRect(960, 98, 220, 36, {109, 93, 252, 255});
+    drawCenteredText("+ ADD ADDON (X)", 960, 98, 220, 36, {255, 255, 255, 255}, 16);
 
     const auto& addons = m_addonManager.getAddons();
-    int startY = 195;
-    int itemH = 60;
+    if (addons.empty()) {
+        drawText("No addons installed.", 70, 160, {200, 200, 220, 255}, 20);
+        return;
+    }
 
+    int startY = 160;
+    int itemH = 60;
     for (size_t i = 0; i < addons.size(); ++i) {
         int y = startY + static_cast<int>(i) * itemH;
         bool isSelected = (static_cast<int>(i) == m_selectedAddonIndex);
 
-        SDL_Color bg = isSelected ? SDL_Color{40, 46, 68, 255} : SDL_Color{28, 32, 45, 255};
-        drawRect(70, y, 1140, itemH - 10, bg);
+        drawRect(70, y, 1140, itemH - 10, isSelected ? SDL_Color{35, 42, 65, 255} : SDL_Color{28, 32, 45, 255});
 
         if (isSelected) {
-            drawRect(68, y - 2, 1144, itemH - 6, {109, 93, 252, 255}, false);
+            drawRect(68, y - 2, 1144, itemH - 6, {0, 212, 255, 255}, false);
         }
 
-        std::string status = addons[i].enabled ? "[ENABLED]" : "[DISABLED]";
-        SDL_Color statusCol = addons[i].enabled ? SDL_Color{46, 204, 113, 255} : SDL_Color{231, 76, 60, 255};
+        drawText(addons[i].manifest.name, 90, y + 8, {255, 255, 255, 255}, 20);
+        drawText(addons[i].manifest.description, 90, y + 30, {150, 155, 175, 255}, 14);
 
-        drawText(status, 90, y + 14, statusCol, 18);
-        drawText(addons[i].manifest.name + " (" + addons[i].manifest.version + ")", 230, y + 14, {255, 255, 255, 255}, 20);
-        drawText(addons[i].url, 700, y + 16, {140, 145, 170, 255}, 16);
+        // Status badge
+        if (addons[i].enabled) {
+            drawRect(1070, y + 10, 110, 30, {40, 120, 60, 255});
+            drawCenteredText("ENABLED", 1070, y + 10, 110, 30, {255, 255, 255, 255}, 14);
+        } else {
+            drawRect(1070, y + 10, 110, 30, {90, 40, 40, 255});
+            drawCenteredText("DISABLED", 1070, y + 10, 110, 30, {255, 255, 255, 255}, 14);
+        }
     }
 }
 
 void UiEngine::renderPlayer() {
+    // 1. Render decoded video frame
+    if (m_videoTexture) {
+        m_player.renderFrame(m_videoTexture);
+        SDL_RenderCopy(m_renderer, m_videoTexture, nullptr, nullptr);
+    }
+
     PlaybackState st = m_player.getState();
 
+    // 2. Error message card if error occurred
+    if (!st.errorMessage.empty()) {
+        drawRect(240, 260, 800, 140, {25, 20, 28, 240});
+        drawRect(240, 260, 800, 140, {255, 60, 60, 255}, false);
+        drawCenteredText("Playback Error", 240, 275, 800, 30, {255, 80, 80, 255}, 22);
+        drawCenteredText(st.errorMessage, 240, 310, 800, 30, {230, 230, 240, 255}, 18);
+        drawCenteredText("Press (B) or tap ◀ to return to streams", 240, 350, 800, 30, {180, 185, 200, 255}, 16);
+    }
+    // 3. Buffering Indicator
+    else if (st.isBuffering || (st.isPlaying && st.currentTime == 0.0 && st.duration == 0.0)) {
+        int bufW = 260;
+        int bufH = 46;
+        int bufX = (1280 - bufW) / 2;
+        int bufY = 320;
+        drawRect(bufX, bufY, bufW, bufH, {20, 24, 36, 220});
+        drawRect(bufX, bufY, bufW, bufH, {0, 212, 255, 255}, false);
+        std::string bufText = "BUFFERING (" + std::to_string(st.cachePercent) + "%)...";
+        drawCenteredText(bufText, bufX, bufY, bufW, bufH, {0, 212, 255, 255}, 18);
+    }
+
+    // 4. On-Screen Display (OSD) HUD
     if (m_showOsd) {
         // Top banner with Back button
         drawRect(0, 0, 1280, 80, {10, 12, 18, 220});
         drawRect(30, 20, 50, 40, {40, 45, 60, 255});
         drawCenteredText("◀", 30, 20, 50, 40, {255, 255, 255, 255}, 22);
 
-        drawText(st.currentTitle, 100, 26, {255, 255, 255, 255}, 26);
+        drawText(st.currentTitle, 100, 26, {255, 255, 255, 255}, 24);
+
+        if (!st.hwdecCurrent.empty() && st.hwdecCurrent != "no") {
+            drawRect(1110, 24, 130, 30, {35, 75, 45, 255});
+            drawCenteredText("NVDEC HW", 1110, 24, 130, 30, {80, 240, 120, 255}, 14);
+        }
 
         // Bottom HUD
         drawRect(0, 600, 1280, 120, {10, 12, 18, 220});
@@ -715,7 +1048,7 @@ void UiEngine::renderPlayer() {
         drawText(timeStr, 40, 620, {220, 220, 240, 255}, 20);
 
         if (st.isPaused) {
-            drawText("PAUSED", 1200, 620, {230, 180, 50, 255}, 20, true);
+            drawText("PAUSED", 1190, 620, {230, 180, 50, 255}, 20, true);
         }
 
         // Timeline Scrubber
@@ -727,6 +1060,7 @@ void UiEngine::renderPlayer() {
 
         if (st.duration > 0.0) {
             int filledW = static_cast<int>((st.currentTime / st.duration) * barW);
+            filledW = std::clamp(filledW, 0, barW);
             drawRect(barX, barY, filledW, barH, {109, 93, 252, 255});
             drawRect(barX + filledW - 6, barY - 4, 12, 20, {0, 212, 255, 255});
         }
@@ -734,22 +1068,55 @@ void UiEngine::renderPlayer() {
 }
 
 void UiEngine::openSearch() {
-    std::string query = requestTextInput("Search Movies & Series");
+    std::string query = requestTextInput("Search Movies & TV Shows");
     if (!query.empty()) {
         m_isLoading = true;
-        auto catalogAddon = m_addonManager.getCatalogAddon(m_contentType);
-        if (catalogAddon) {
-            m_items = StremioClient::searchCatalog(*catalogAddon, m_contentType, query);
-            m_selectedGridIndex = 0;
-            m_page = 0;
-            m_state = UiState::CATALOG;
+        auto movieAddon = m_addonManager.getCatalogAddon("movie");
+        auto seriesAddon = m_addonManager.getCatalogAddon("series");
 
-            int itemsPerPage = m_gridCols * m_gridRows;
-            for (int i = 0; i < itemsPerPage && i < static_cast<int>(m_items.size()); ++i) {
-                queuePosterDownload(m_items[i].poster);
-            }
+        if (movieAddon || seriesAddon) {
+            m_searchQuery = query;
+            m_isSearchActive = true;
+
+            m_searchMovieResults = movieAddon ? StremioClient::searchCatalog(*movieAddon, "movie", query) : std::vector<MetaItem>{};
+            m_searchSeriesResults = seriesAddon ? StremioClient::searchCatalog(*seriesAddon, "series", query) : std::vector<MetaItem>{};
+
+            m_searchAllResults = m_searchMovieResults;
+            m_searchAllResults.insert(m_searchAllResults.end(), m_searchSeriesResults.begin(), m_searchSeriesResults.end());
+
+            setSearchTab(0); // Default to ALL tab
+            m_state = UiState::CATALOG;
         }
         m_isLoading = false;
+    }
+}
+
+void UiEngine::clearSearch() {
+    m_isSearchActive = false;
+    m_searchQuery = "";
+    m_searchAllResults.clear();
+    m_searchMovieResults.clear();
+    m_searchSeriesResults.clear();
+    m_page = 0;
+    m_selectedGridIndex = 0;
+    loadCatalogData();
+}
+
+void UiEngine::setSearchTab(int tab) {
+    m_searchTab = tab;
+    if (tab == 0) {
+        m_items = m_searchAllResults;
+    } else if (tab == 1) {
+        m_items = m_searchMovieResults;
+    } else if (tab == 2) {
+        m_items = m_searchSeriesResults;
+    }
+    m_page = 0;
+    m_selectedGridIndex = 0;
+
+    int itemsPerPage = m_gridCols * m_gridRows;
+    for (int i = 0; i < itemsPerPage && i < static_cast<int>(m_items.size()); ++i) {
+        queuePosterDownload(m_items[i].poster);
     }
 }
 
@@ -761,20 +1128,28 @@ void UiEngine::openAddAddon() {
 }
 
 void UiEngine::playStream(const StreamItem& stream) {
-    if (!stream.url.empty()) {
-        std::cout << "[Playback] Launching stream: " << stream.name << " URL: " << stream.url << std::endl;
-        if (!m_player.isInitialized()) {
-            std::cout << "[Playback] Initializing libmpv..." << std::endl;
-            if (!m_player.initialize()) {
-                std::cerr << "[Playback] Failed to initialize libmpv!" << std::endl;
-                return;
-            }
-        }
-        m_player.play(stream.url, m_selectedMeta.name + " (" + stream.name + ")");
-        m_state = UiState::PLAYER;
-        m_lastPlayerInputTime = SDL_GetTicks();
-        m_showOsd = true;
+    if (stream.url.empty()) {
+        std::cerr << "[Playback] Stream has no direct URL (Torrent infoHash: " << stream.infoHash << ")" << std::endl;
+        m_streamErrorMessage = "Direct playback requires an HTTPS stream or Debrid addon (e.g. Torrentio + Real-Debrid). Raw P2P torrents are not supported directly.";
+        return;
     }
+
+    m_streamErrorMessage = "";
+    std::cout << "[Playback] Launching stream: " << stream.name << " URL: " << stream.url << std::endl;
+    if (!m_player.isInitialized()) {
+        std::cout << "[Playback] Initializing libmpv..." << std::endl;
+        if (!m_player.initialize()) {
+            std::cerr << "[Playback] Failed to initialize libmpv!" << std::endl;
+            m_streamErrorMessage = "Failed to initialize libmpv video engine!";
+            return;
+        }
+        applySettingsToPlayer();
+    }
+
+    m_player.play(stream.url, m_selectedMeta.name + " (" + stream.name + ")");
+    m_state = UiState::PLAYER;
+    m_lastPlayerInputTime = SDL_GetTicks();
+    m_showOsd = true;
 }
 
 void UiEngine::applyStreamFilter() {
@@ -806,33 +1181,60 @@ void UiEngine::handleTouchTap(int x, int y) {
     std::cout << "[Touch] Tap at (" << x << ", " << y << ") in state " << static_cast<int>(m_state) << std::endl;
 
     // Header Taps (y: 0..70)
-    if (y < 70) {
-        if (x >= 290 && x <= 410) { // Movies tab
-            if (m_contentType != "movie") {
-                m_contentType = "movie";
-                m_page = 0;
-                loadCatalogData();
-                m_state = UiState::CATALOG;
+    if (y < 70 && m_state != UiState::PLAYER && m_state != UiState::STREAMS && m_state != UiState::CATEGORIES_MODAL) {
+        if (!m_isSearchActive) {
+            if (x >= 235 && x <= 330) { // Movies tab
+                if (m_contentType != "movie" || m_state != UiState::CATALOG) {
+                    m_contentType = "movie";
+                    m_page = 0;
+                    m_state = UiState::CATALOG;
+                    loadCatalogData();
+                }
+                return;
             }
-            return;
-        }
-        if (x >= 420 && x <= 540) { // Series tab
-            if (m_contentType != "series") {
-                m_contentType = "series";
-                m_page = 0;
-                loadCatalogData();
-                m_state = UiState::CATALOG;
+            if (x >= 340 && x <= 435) { // Series tab
+                if (m_contentType != "series" || m_state != UiState::CATALOG) {
+                    m_contentType = "series";
+                    m_page = 0;
+                    m_state = UiState::CATALOG;
+                    loadCatalogData();
+                }
+                return;
             }
-            return;
-        }
-        if (x >= 800 && x <= 950) { // Page indicator
-            if (x < 875) onPagePrev();
-            else onPageNext();
-            return;
-        }
-        if (x >= 1080 && x <= 1260) { // Addons button
-            onActionMenu();
-            return;
+            if (x >= 445 && x <= 645) { // Categories pill
+                m_modalCategoryIndex = m_selectedCategoryIndex;
+                m_state = UiState::CATEGORIES_MODAL;
+                return;
+            }
+            if (x >= 655 && x <= 780) { // Page indicator
+                if (x < 715) onPagePrev();
+                else onPageNext();
+                return;
+            }
+            if (x >= 790 && x <= 930) { // Settings button
+                m_state = (m_state == UiState::SETTINGS) ? UiState::CATALOG : UiState::SETTINGS;
+                return;
+            }
+            if (x >= 940 && x <= 1060) { // Addons button
+                m_state = (m_state == UiState::ADDONS) ? UiState::CATALOG : UiState::ADDONS;
+                return;
+            }
+            if (x >= 1070 && x <= 1260) { // Search button
+                openSearch();
+                return;
+            }
+        } else {
+            // Search mode tabs
+            if (x >= 320 && x <= 440) { setSearchTab(0); return; }
+            if (x >= 450 && x <= 590) { setSearchTab(1); return; }
+            if (x >= 600 && x <= 750) { setSearchTab(2); return; }
+            if (x >= 760 && x <= 870) { clearSearch(); return; }
+            if (x >= 880 && x <= 990) {
+                if (x < 935) onPagePrev(); else onPageNext();
+                return;
+            }
+            if (x >= 1000 && x <= 1120) { m_state = UiState::SETTINGS; return; }
+            if (x >= 1130 && x <= 1260) { m_state = UiState::ADDONS; return; }
         }
     }
 
@@ -840,7 +1242,7 @@ void UiEngine::handleTouchTap(int x, int y) {
     if (m_state == UiState::CATALOG) {
         // Footer bar tap for Search
         if (y >= 660) {
-            onActionSearch();
+            openSearch();
             return;
         }
 
@@ -867,6 +1269,65 @@ void UiEngine::handleTouchTap(int x, int y) {
                 } else {
                     m_selectedGridIndex = i; // First tap highlights card
                 }
+                return;
+            }
+        }
+    } else if (m_state == UiState::CATEGORIES_MODAL) {
+        int mw = 840;
+        int mh = 490;
+        int mx = (1280 - mw) / 2;
+        int my = (720 - mh) / 2;
+
+        // Close button (X) or outside modal
+        if (x >= mx + mw - 50 && x <= mx + mw && y >= my && y <= my + 50) {
+            m_state = UiState::CATALOG;
+            return;
+        }
+        if (x < mx || x > mx + mw || y < my || y > my + mh) {
+            m_state = UiState::CATALOG;
+            return;
+        }
+
+        int cols = 4;
+        int btnW = 180;
+        int btnH = 68;
+        int gapX = 18;
+        int gapY = 18;
+        int startX = mx + 30;
+        int startY = my + 80;
+
+        for (size_t i = 0; i < m_categories.size() && i < 16; ++i) {
+            int c = static_cast<int>(i) % cols;
+            int r = static_cast<int>(i) / cols;
+            int bx = startX + c * (btnW + gapX);
+            int by = startY + r * (btnH + gapY);
+
+            if (x >= bx && x <= bx + btnW && y >= by && y <= by + btnH) {
+                m_selectedCategoryIndex = static_cast<int>(i);
+                m_page = 0;
+                m_state = UiState::CATALOG;
+                loadCatalogData();
+                return;
+            }
+        }
+    } else if (m_state == UiState::SETTINGS) {
+        int panelW = 1200;
+        int panelX = 40;
+        int panelY = 90;
+
+        // Back button
+        if (x >= panelX + panelW - 130 && x <= panelX + panelW - 20 && y >= panelY + 9 && y <= panelY + 41) {
+            m_state = UiState::CATALOG;
+            return;
+        }
+
+        int listY = panelY + 58;
+        int rowH = 41;
+        for (int i = 0; i < 11; ++i) {
+            int ry = listY + i * rowH;
+            if (x >= panelX + 15 && x <= panelX + panelW - 15 && y >= ry && y <= ry + rowH) {
+                m_selectedSettingIndex = i;
+                changeSetting(1);
                 return;
             }
         }
@@ -939,14 +1400,14 @@ void UiEngine::handleTouchTap(int x, int y) {
         }
     } else if (m_state == UiState::ADDONS) {
         // "+ ADD ADDON" button
-        if (x >= 960 && x <= 1180 && y >= 110 && y <= 155) {
+        if (x >= 960 && x <= 1180 && y >= 98 && y <= 134) {
             openAddAddon();
             return;
         }
 
         // Tapping an addon row to toggle
         const auto& addons = m_addonManager.getAddons();
-        int startY = 195;
+        int startY = 160;
         int itemH = 60;
         for (size_t i = 0; i < addons.size(); ++i) {
             int itemY = startY + static_cast<int>(i) * itemH;
@@ -997,6 +1458,10 @@ void UiEngine::onNavigateLeft() {
             onPagePrev();
             m_selectedGridIndex += (m_gridCols - 1);
         }
+    } else if (m_state == UiState::CATEGORIES_MODAL) {
+        m_modalCategoryIndex = (m_modalCategoryIndex - 1 + static_cast<int>(m_categories.size())) % static_cast<int>(m_categories.size());
+    } else if (m_state == UiState::SETTINGS) {
+        changeSetting(-1);
     } else if (m_state == UiState::PLAYER) {
         m_player.seekRelative(-10.0);
         m_lastPlayerInputTime = SDL_GetTicks();
@@ -1016,6 +1481,10 @@ void UiEngine::onNavigateRight() {
             m_selectedGridIndex -= (m_gridCols - 1);
             if (m_selectedGridIndex < 0) m_selectedGridIndex = 0;
         }
+    } else if (m_state == UiState::CATEGORIES_MODAL) {
+        m_modalCategoryIndex = (m_modalCategoryIndex + 1) % static_cast<int>(m_categories.size());
+    } else if (m_state == UiState::SETTINGS) {
+        changeSetting(1);
     } else if (m_state == UiState::PLAYER) {
         m_player.seekRelative(10.0);
         m_lastPlayerInputTime = SDL_GetTicks();
@@ -1028,6 +1497,10 @@ void UiEngine::onNavigateUp() {
         if (m_selectedGridIndex >= m_gridCols) {
             m_selectedGridIndex -= m_gridCols;
         }
+    } else if (m_state == UiState::CATEGORIES_MODAL) {
+        m_modalCategoryIndex = (m_modalCategoryIndex - 4 + static_cast<int>(m_categories.size())) % static_cast<int>(m_categories.size());
+    } else if (m_state == UiState::SETTINGS) {
+        if (m_selectedSettingIndex > 0) m_selectedSettingIndex--;
     } else if (m_state == UiState::STREAMS) {
         if (m_selectedStreamIndex > 0) {
             m_selectedStreamIndex--;
@@ -1050,6 +1523,10 @@ void UiEngine::onNavigateDown() {
         if (m_selectedGridIndex + m_gridCols < maxItemsOnPage) {
             m_selectedGridIndex += m_gridCols;
         }
+    } else if (m_state == UiState::CATEGORIES_MODAL) {
+        m_modalCategoryIndex = (m_modalCategoryIndex + 4) % static_cast<int>(m_categories.size());
+    } else if (m_state == UiState::SETTINGS) {
+        if (m_selectedSettingIndex < 10) m_selectedSettingIndex++;
     } else if (m_state == UiState::STREAMS) {
         if (m_selectedStreamIndex + 1 < static_cast<int>(m_availableStreams.size())) {
             m_selectedStreamIndex++;
@@ -1066,19 +1543,31 @@ void UiEngine::onNavigateDown() {
 }
 
 void UiEngine::onPagePrev() {
-    if (m_state == UiState::CATALOG && m_page > 0) {
-        m_page--;
-        m_selectedGridIndex = 0;
-        int itemsPerPage = m_gridCols * m_gridRows;
-        int startIndex = m_page * itemsPerPage;
-        for (int i = 0; i < itemsPerPage && (startIndex + i) < static_cast<int>(m_items.size()); ++i) {
-            queuePosterDownload(m_items[startIndex + i].poster);
+    if (m_state == UiState::CATALOG) {
+        if (m_isSearchActive) {
+            setSearchTab((m_searchTab + 2) % 3);
+            return;
         }
+        if (m_page > 0) {
+            m_page--;
+            m_selectedGridIndex = 0;
+            int itemsPerPage = m_gridCols * m_gridRows;
+            int startIndex = m_page * itemsPerPage;
+            for (int i = 0; i < itemsPerPage && (startIndex + i) < static_cast<int>(m_items.size()); ++i) {
+                queuePosterDownload(m_items[startIndex + i].poster);
+            }
+        }
+    } else if (m_state == UiState::SETTINGS) {
+        changeSetting(-1);
     }
 }
 
 void UiEngine::onPageNext() {
     if (m_state == UiState::CATALOG) {
+        if (m_isSearchActive) {
+            setSearchTab((m_searchTab + 1) % 3);
+            return;
+        }
         int itemsPerPage = m_gridCols * m_gridRows;
         if ((m_page + 1) * itemsPerPage < static_cast<int>(m_items.size())) {
             m_page++;
@@ -1088,6 +1577,8 @@ void UiEngine::onPageNext() {
                 queuePosterDownload(m_items[startIndex + i].poster);
             }
         }
+    } else if (m_state == UiState::SETTINGS) {
+        changeSetting(1);
     }
 }
 
@@ -1095,9 +1586,11 @@ void UiEngine::onActionConfirm() {
     if (m_state == UiState::CATALOG && !m_items.empty()) {
         int idx = m_page * (m_gridCols * m_gridRows) + m_selectedGridIndex;
         if (idx < static_cast<int>(m_items.size())) {
-            auto catAddon = m_addonManager.getCatalogAddon(m_contentType);
+            auto catAddon = m_addonManager.getCatalogAddon(m_items[idx].type);
+            if (!catAddon) catAddon = m_addonManager.getCatalogAddon("movie");
+
             if (catAddon) {
-                auto fullMeta = StremioClient::fetchMeta(*catAddon, m_contentType, m_items[idx].id);
+                auto fullMeta = StremioClient::fetchMeta(*catAddon, m_items[idx].type, m_items[idx].id);
                 m_selectedMeta = fullMeta ? *fullMeta : m_items[idx];
             } else {
                 m_selectedMeta = m_items[idx];
@@ -1105,6 +1598,13 @@ void UiEngine::onActionConfirm() {
             queuePosterDownload(m_selectedMeta.poster);
             m_state = UiState::DETAILS;
         }
+    } else if (m_state == UiState::CATEGORIES_MODAL) {
+        m_selectedCategoryIndex = m_modalCategoryIndex;
+        m_page = 0;
+        m_state = UiState::CATALOG;
+        loadCatalogData();
+    } else if (m_state == UiState::SETTINGS) {
+        changeSetting(1);
     } else if (m_state == UiState::DETAILS) {
         m_rawStreams = m_addonManager.aggregateStreams(m_selectedMeta.type, m_selectedMeta.id);
         applyStreamFilter();
@@ -1125,13 +1625,18 @@ void UiEngine::onActionConfirm() {
 }
 
 void UiEngine::onActionBack() {
-    if (m_state == UiState::STREAMS) {
+    if (m_state == UiState::CATEGORIES_MODAL) {
+        m_state = UiState::CATALOG;
+    } else if (m_state == UiState::SETTINGS) {
+        m_state = UiState::CATALOG;
+    } else if (m_state == UiState::STREAMS) {
         m_state = UiState::DETAILS;
     } else if (m_state == UiState::DETAILS || m_state == UiState::ADDONS) {
         m_state = UiState::CATALOG;
+    } else if (m_state == UiState::CATALOG && m_isSearchActive) {
+        clearSearch();
     } else if (m_state == UiState::PLAYER) {
         m_player.stop();
-        m_player.shutdown();
         m_state = UiState::DETAILS;
     }
 }
@@ -1141,6 +1646,8 @@ void UiEngine::onActionSearch() {
         editCustomRegex();
     } else if (m_state == UiState::ADDONS) {
         openAddAddon();
+    } else if (m_state == UiState::SETTINGS) {
+        if (m_selectedSettingIndex == 8) editCustomRegex();
     } else {
         openSearch();
     }
@@ -1150,14 +1657,24 @@ void UiEngine::onActionToggleType() {
     if (m_state == UiState::STREAMS) {
         cycleFilterMode();
     } else if (m_state == UiState::CATALOG) {
-        m_contentType = (m_contentType == "movie") ? "series" : "movie";
-        m_page = 0;
-        loadCatalogData();
+        if (m_isSearchActive) {
+            setSearchTab((m_searchTab + 1) % 3);
+        } else {
+            m_contentType = (m_contentType == "movie") ? "series" : "movie";
+            m_page = 0;
+            loadCatalogData();
+        }
     }
 }
 
 void UiEngine::onActionMenu() {
-    m_state = (m_state == UiState::ADDONS) ? UiState::CATALOG : UiState::ADDONS;
+    if (m_state == UiState::CATALOG) {
+        m_state = UiState::SETTINGS;
+    } else if (m_state == UiState::SETTINGS) {
+        m_state = UiState::ADDONS;
+    } else {
+        m_state = UiState::CATALOG;
+    }
 }
 
 void UiEngine::onActionExit() {
@@ -1210,6 +1727,15 @@ void UiEngine::handleInput() {
                 case SDLK_BACKSPACE: onActionBack(); break;
                 case SDLK_x:         onActionSearch(); break;
                 case SDLK_y:         onActionToggleType(); break;
+                case SDLK_c:
+                    if (m_state == UiState::CATALOG) {
+                        m_modalCategoryIndex = m_selectedCategoryIndex;
+                        m_state = UiState::CATEGORIES_MODAL;
+                    }
+                    break;
+                case SDLK_s:
+                    m_state = (m_state == UiState::SETTINGS) ? UiState::CATALOG : UiState::SETTINGS;
+                    break;
                 case SDLK_MINUS:     onActionMenu(); break;
                 case SDLK_PLUS:
                 case SDLK_EQUALS:    onActionExit(); break;
@@ -1231,6 +1757,12 @@ void UiEngine::handleInput() {
                     onPagePrev(); break;
                 case 7:  // R
                     onPageNext(); break;
+                case 8:  // ZL
+                    if (m_state == UiState::CATALOG) {
+                        m_modalCategoryIndex = m_selectedCategoryIndex;
+                        m_state = UiState::CATEGORIES_MODAL;
+                    }
+                    break;
                 case 10: // Plus
                     onActionExit(); break;
                 case 11: // Minus
@@ -1295,8 +1827,10 @@ void UiEngine::update() {
 void UiEngine::render() {
     if (!m_renderer) return;
 
-    SDL_SetRenderDrawColor(m_renderer, 15, 16, 22, 255);
-    SDL_RenderClear(m_renderer);
+    if (m_state != UiState::PLAYER) {
+        SDL_SetRenderDrawColor(m_renderer, 15, 16, 22, 255);
+        SDL_RenderClear(m_renderer);
+    }
 
     switch (m_state) {
         case UiState::CATALOG:
@@ -1313,6 +1847,16 @@ void UiEngine::render() {
             drawHeader();
             renderDetails();
             renderStreams();
+            drawFooter();
+            break;
+        case UiState::CATEGORIES_MODAL:
+            drawHeader();
+            renderCatalog();
+            renderCategoriesModal();
+            drawFooter();
+            break;
+        case UiState::SETTINGS:
+            renderSettings();
             drawFooter();
             break;
         case UiState::ADDONS:

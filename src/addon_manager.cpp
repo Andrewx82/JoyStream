@@ -54,6 +54,16 @@ bool AddonManager::loadConfig(const std::string& path) {
             m_filterConfig.maxFileSizeGB = j["maxFileSizeGB"].get<float>();
         }
 
+        if (j.contains("settings") && j["settings"].is_object()) {
+            const auto& s = j["settings"];
+            m_settings.hwdecEnabled = s.value("hwdecEnabled", true);
+            m_settings.audioLanguage = s.value("audioLanguage", "auto");
+            m_settings.subtitlesEnabled = s.value("subtitlesEnabled", true);
+            m_settings.subtitleLanguage = s.value("subtitleLanguage", "eng");
+            m_settings.bufferCacheSize = s.value("bufferCacheSize", "128M");
+            m_settings.networkTimeoutSeconds = s.value("networkTimeoutSeconds", 20);
+        }
+
         if (j.contains("addons") && j["addons"].is_array()) {
             for (const auto& a : j["addons"]) {
                 std::string url = a.value("url", "");
@@ -91,6 +101,16 @@ bool AddonManager::saveConfig(const std::string& path) {
     j["customExcludeRegex"] = m_filterConfig.customExcludeRegex;
     j["customIncludeRegex"] = m_filterConfig.customIncludeRegex;
     j["maxFileSizeGB"] = m_filterConfig.maxFileSizeGB;
+
+    json s;
+    s["hwdecEnabled"] = m_settings.hwdecEnabled;
+    s["audioLanguage"] = m_settings.audioLanguage;
+    s["subtitlesEnabled"] = m_settings.subtitlesEnabled;
+    s["subtitleLanguage"] = m_settings.subtitleLanguage;
+    s["bufferCacheSize"] = m_settings.bufferCacheSize;
+    s["networkTimeoutSeconds"] = m_settings.networkTimeoutSeconds;
+    j["settings"] = s;
+
     j["addons"] = json::array();
 
     for (const auto& addon : m_addons) {

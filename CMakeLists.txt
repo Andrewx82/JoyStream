@@ -48,6 +48,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch" OR NINTENDO_SWITCH)
     nx_create_nro(joystream
         TARGET joystream
         NACP "${CMAKE_CURRENT_BINARY_DIR}/joystream.nacp"
+        ICON "${CMAKE_CURRENT_SOURCE_DIR}/assets/icon.jpg"
         OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/joystream.nro"
     )
 else()

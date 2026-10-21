@@ -23,6 +23,8 @@ enum class UiState {
     DETAILS,
     STREAMS,
     ADDONS,
+    SETTINGS,
+    CATEGORIES_MODAL,
     PLAYER
 };
 
@@ -75,13 +77,19 @@ private:
     void renderDetails();
     void renderStreams();
     void renderAddons();
+    void renderSettings();
+    void renderCategoriesModal();
     void renderPlayer();
 
     // Actions
     void loadCatalogData();
     void openSearch();
+    void clearSearch();
+    void setSearchTab(int tab);
     void openAddAddon();
     void playStream(const StreamItem& stream);
+    void changeSetting(int delta);
+    void applySettingsToPlayer();
 
     // SDL Resources
     SDL_Window* m_window = nullptr;
@@ -105,6 +113,23 @@ private:
     int m_page = 0;
     bool m_isLoading = false;
 
+    // Categories
+    std::vector<std::string> m_categories = {
+        "Popular", "Top Rated", "New Releases", "Action", "Animation", "Comedy",
+        "Crime", "Documentary", "Drama", "Family", "Fantasy", "Horror",
+        "Mystery", "Romance", "Sci-Fi", "Thriller"
+    };
+    int m_selectedCategoryIndex = 0;
+    int m_modalCategoryIndex = 0;
+
+    // Search & Tabs
+    bool m_isSearchActive = false;
+    std::string m_searchQuery;
+    int m_searchTab = 0; // 0: All, 1: Movies, 2: TV Shows
+    std::vector<MetaItem> m_searchAllResults;
+    std::vector<MetaItem> m_searchMovieResults;
+    std::vector<MetaItem> m_searchSeriesResults;
+
     // Details View
     MetaItem m_selectedMeta;
     int m_detailsActionIndex = 0;
@@ -113,6 +138,7 @@ private:
     std::vector<StreamItem> m_rawStreams;
     std::vector<StreamItem> m_availableStreams;
     int m_selectedStreamIndex = 0;
+    std::string m_streamErrorMessage;
     FilterConfig m_filterConfig;
     void applyStreamFilter();
     void cycleFilterMode();
@@ -120,6 +146,13 @@ private:
 
     // Addons View
     int m_selectedAddonIndex = 0;
+
+    // Settings View
+    AppSettings m_settings;
+    int m_selectedSettingIndex = 0;
+
+    // Video Streaming Texture
+    SDL_Texture* m_videoTexture = nullptr;
 
     // OSD timer
     uint32_t m_lastPlayerInputTime = 0;

@@ -86,7 +86,13 @@ export CXXFLAGS		:=	$(CXXFLAGS) $(INCLUDE)
 export LIBPATHS		:=	$(foreach dir,$(LIBDIRS),-L$(dir)/lib)
 
 ifeq ($(strip $(NO_ICON)),)
-	export NROFLAGS += --icon=$(DEVKITPRO)/libnx/default_icon.jpg
+	ifneq ("$(wildcard $(CURDIR)/assets/icon.jpg)","")
+		export NROFLAGS += --icon=$(CURDIR)/assets/icon.jpg
+	else ifneq ("$(wildcard $(CURDIR)/icon.jpg)","")
+		export NROFLAGS += --icon=$(CURDIR)/icon.jpg
+	else
+		export NROFLAGS += --icon=$(DEVKITPRO)/libnx/default_icon.jpg
+	endif
 endif
 
 ifeq ($(strip $(NO_NACP)),)

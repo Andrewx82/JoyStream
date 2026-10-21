@@ -14,6 +14,15 @@ struct InstalledAddon {
     AddonManifest manifest;
 };
 
+struct AppSettings {
+    bool hwdecEnabled = true;
+    std::string audioLanguage = "auto";       // auto, eng, spa, fre, ger, jpn, por, ita
+    bool subtitlesEnabled = true;
+    std::string subtitleLanguage = "eng";     // eng, spa, fre, ger, jpn, por, ita
+    std::string bufferCacheSize = "128M";     // 64M, 128M, 256M
+    int networkTimeoutSeconds = 20;           // 10, 15, 20, 30
+};
+
 class AddonManager {
 public:
     AddonManager();
@@ -32,6 +41,11 @@ public:
 
     // Toggle addon enabled state
     void setAddonEnabled(const std::string& id, bool enabled);
+
+    // Settings
+    const AppSettings& getSettings() const { return m_settings; }
+    void setSettings(const AppSettings& s) { m_settings = s; saveConfig(); }
+    AppSettings& getSettingsMutable() { return m_settings; }
 
     // Filter Config
     const FilterConfig& getFilterConfig() const { return m_filterConfig; }
@@ -55,6 +69,7 @@ private:
     std::vector<InstalledAddon> m_addons;
     std::string m_configPath;
     FilterConfig m_filterConfig;
+    AppSettings m_settings;
 };
 
 } // namespace Stremio
