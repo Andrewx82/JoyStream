@@ -135,10 +135,12 @@ bool UiEngine::initialize() {
               << " medium=" << (m_fontMedium != nullptr)
               << " large=" << (m_fontLarge != nullptr) << std::endl;
 
-    // Load installed addons
+    // Load installed addons & filter settings
     std::cout << "[Config] Loading addon configurations..." << std::endl;
     m_addonManager.loadConfig();
-    std::cout << "[Config] Active addons: " << m_addonManager.getAddons().size() << std::endl;
+    m_filterConfig = m_addonManager.getFilterConfig();
+    std::cout << "[Config] Active addons: " << m_addonManager.getAddons().size()
+              << " Filter: " << StreamFilter::getModeName(m_filterConfig.mode) << std::endl;
 
     // Start background image loader thread
     m_imageThreadRunning = true;
@@ -566,29 +568,54 @@ void UiEngine::renderDetails() {
 }
 
 void UiEngine::renderStreams() {
-    drawRect(0, 0, 1280, 720, {10, 10, 15, 210});
+    drawRect(0, 0, 1280, 720, {10, 10, 15, 215});
 
-    int mw = 860;
-    int mh = 500;
+    int mw = 900;
+    int mh = 530;
     int mx = (1280 - mw) / 2;
     int my = (720 - mh) / 2;
 
     drawRect(mx, my, mw, mh, {24, 27, 38, 255});
-    drawRect(mx, my, mw, 50, {35, 40, 58, 255});
-    drawText("AVAILABLE STREAMS (" + std::to_string(m_availableStreams.size()) + ")", mx + 30, my + 14, {255, 255, 255, 255}, 22);
+    drawRect(mx, my, mw, 52, {35, 40, 58, 255});
+
+    std::string countStr = "STREAMS (" + std::to_string(m_availableStreams.size()) + "/" + std::to_string(m_rawStreams.size()) + ")";
+    drawText(countStr, mx + 25, my + 14, {255, 255, 255, 255}, 22);
+
+    // Filter Mode Toggle Button (Touch / Y)
+    int fBtnX = mx + 350;
+    int fBtnY = my + 9;
+    int fBtnW = 270;
+    int fBtnH = 34;
+    drawRect(fBtnX, fBtnY, fBtnW, fBtnH, {48, 56, 82, 255});
+    drawRect(fBtnX, fBtnY, fBtnW, fBtnH, {0, 212, 255, 255}, false);
+    drawCenteredText("Filter: " + StreamFilter::getModeName(m_filterConfig.mode) + " (Y)", fBtnX, fBtnY, fBtnW, fBtnH, {0, 212, 255, 255}, 16);
+
+    // Edit Custom Regex Button (Touch / X)
+    if (m_filterConfig.mode == StreamFilterMode::CUSTOM_REGEX) {
+        int eBtnX = fBtnX + fBtnW + 10;
+        int eBtnY = fBtnY;
+        int eBtnW = 150;
+        int eBtnH = fBtnH;
+        drawRect(eBtnX, eBtnY, eBtnW, eBtnH, {109, 93, 252, 255});
+        drawCenteredText("Edit Regex (X)", eBtnX, eBtnY, eBtnW, eBtnH, {255, 255, 255, 255}, 16);
+    }
 
     // Close button (X) on top-right of modal
     drawRect(mx + mw - 45, my + 10, 32, 32, {60, 65, 85, 255});
     drawCenteredText("X", mx + mw - 45, my + 10, 32, 32, {255, 255, 255, 255}, 18);
 
+    // Filter mode description subtitle
+    std::string modeDesc = StreamFilter::getModeDescription(m_filterConfig.mode);
+    drawText(modeDesc, mx + 25, my + 56, {150, 155, 180, 255}, 14);
+
     if (m_availableStreams.empty()) {
-        drawText("No streams found from active addons.", mx + 50, my + 120, {200, 150, 150, 255}, 20);
-        drawText("Tip: Configure Torrentio or Debrid addons in the Addon Menu (-).", mx + 50, my + 160, {160, 165, 185, 255}, 18);
+        drawText("No streams match current filter: " + StreamFilter::getModeName(m_filterConfig.mode), mx + 50, my + 130, {230, 130, 130, 255}, 20);
+        drawText("Tap or press (Y) to cycle filters, or switch to 'Show All'.", mx + 50, my + 170, {180, 185, 205, 255}, 18);
         return;
     }
 
-    int startY = my + 65;
-    int itemH = 65;
+    int startY = my + 78;
+    int itemH = 68;
     int maxVisible = 6;
 
     for (int i = 0; i < maxVisible && i < static_cast<int>(m_availableStreams.size()); ++i) {
@@ -605,12 +632,21 @@ void UiEngine::renderStreams() {
 
         std::string streamName = stream.name;
         std::replace(streamName.begin(), streamName.end(), '\n', ' ');
-        drawText(streamName, mx + 40, y + 10, {0, 212, 255, 255}, 20);
+        drawText(streamName, mx + 35, y + 8, {0, 212, 255, 255}, 20);
+
+        // Badge: Direct HTTPS / Debrid vs P2P
+        if (!stream.url.empty()) {
+            drawRect(mx + mw - 190, y + 10, 150, 22, {35, 75, 45, 255});
+            drawCenteredText("DIRECT / DEBRID", mx + mw - 190, y + 10, 150, 22, {80, 240, 120, 255}, 13);
+        } else {
+            drawRect(mx + mw - 190, y + 10, 150, 22, {70, 50, 30, 255});
+            drawCenteredText("P2P TORRENT", mx + mw - 190, y + 10, 150, 22, {240, 180, 80, 255}, 13);
+        }
 
         std::string title = stream.title;
         std::replace(title.begin(), title.end(), '\n', ' ');
-        if (title.length() > 65) title = title.substr(0, 63) + "..";
-        drawText(title, mx + 40, y + 33, {200, 205, 220, 255}, 16);
+        if (title.length() > 68) title = title.substr(0, 66) + "..";
+        drawText(title, mx + 35, y + 33, {200, 205, 220, 255}, 15);
     }
 }
 
@@ -741,6 +777,29 @@ void UiEngine::playStream(const StreamItem& stream) {
     }
 }
 
+void UiEngine::applyStreamFilter() {
+    m_availableStreams = StreamFilter::filterAndRank(m_rawStreams, m_filterConfig);
+    if (m_selectedStreamIndex >= static_cast<int>(m_availableStreams.size())) {
+        m_selectedStreamIndex = 0;
+    }
+}
+
+void UiEngine::cycleFilterMode() {
+    m_filterConfig.mode = StreamFilter::cycleMode(m_filterConfig.mode);
+    m_addonManager.setFilterConfig(m_filterConfig);
+    applyStreamFilter();
+}
+
+void UiEngine::editCustomRegex() {
+    std::string newRegex = requestTextInput("Edit Exclude Regex", m_filterConfig.customExcludeRegex);
+    if (!newRegex.empty()) {
+        m_filterConfig.customExcludeRegex = newRegex;
+        m_filterConfig.mode = StreamFilterMode::CUSTOM_REGEX;
+        m_addonManager.setFilterConfig(m_filterConfig);
+        applyStreamFilter();
+    }
+}
+
 // ----------------- Touchscreen Tap Handler -----------------
 
 void UiEngine::handleTouchTap(int x, int y) {
@@ -828,8 +887,8 @@ void UiEngine::handleTouchTap(int x, int y) {
             return;
         }
     } else if (m_state == UiState::STREAMS) {
-        int mw = 860;
-        int mh = 500;
+        int mw = 900;
+        int mh = 530;
         int mx = (1280 - mw) / 2;
         int my = (720 - mh) / 2;
 
@@ -839,9 +898,31 @@ void UiEngine::handleTouchTap(int x, int y) {
             return;
         }
 
+        // Tap on Filter Button
+        int fBtnX = mx + 350;
+        int fBtnY = my + 9;
+        int fBtnW = 270;
+        int fBtnH = 34;
+        if (x >= fBtnX && x <= fBtnX + fBtnW && y >= fBtnY && y <= fBtnY + fBtnH) {
+            cycleFilterMode();
+            return;
+        }
+
+        // Tap on Edit Regex Button
+        if (m_filterConfig.mode == StreamFilterMode::CUSTOM_REGEX) {
+            int eBtnX = fBtnX + fBtnW + 10;
+            int eBtnY = fBtnY;
+            int eBtnW = 150;
+            int eBtnH = fBtnH;
+            if (x >= eBtnX && x <= eBtnX + eBtnW && y >= eBtnY && y <= eBtnY + eBtnH) {
+                editCustomRegex();
+                return;
+            }
+        }
+
         // Tapping a stream item
-        int startY = my + 65;
-        int itemH = 65;
+        int startY = my + 78;
+        int itemH = 68;
         for (size_t i = 0; i < 6 && i < m_availableStreams.size(); ++i) {
             int itemY = startY + static_cast<int>(i) * itemH;
             if (x >= mx + 20 && x <= mx + mw - 20 && y >= itemY && y <= itemY + itemH - 8) {
@@ -1025,7 +1106,8 @@ void UiEngine::onActionConfirm() {
             m_state = UiState::DETAILS;
         }
     } else if (m_state == UiState::DETAILS) {
-        m_availableStreams = m_addonManager.aggregateStreams(m_selectedMeta.type, m_selectedMeta.id);
+        m_rawStreams = m_addonManager.aggregateStreams(m_selectedMeta.type, m_selectedMeta.id);
+        applyStreamFilter();
         m_selectedStreamIndex = 0;
         m_state = UiState::STREAMS;
     } else if (m_state == UiState::STREAMS && !m_availableStreams.empty()) {
@@ -1055,7 +1137,9 @@ void UiEngine::onActionBack() {
 }
 
 void UiEngine::onActionSearch() {
-    if (m_state == UiState::ADDONS) {
+    if (m_state == UiState::STREAMS) {
+        editCustomRegex();
+    } else if (m_state == UiState::ADDONS) {
         openAddAddon();
     } else {
         openSearch();
@@ -1063,7 +1147,9 @@ void UiEngine::onActionSearch() {
 }
 
 void UiEngine::onActionToggleType() {
-    if (m_state == UiState::CATALOG) {
+    if (m_state == UiState::STREAMS) {
+        cycleFilterMode();
+    } else if (m_state == UiState::CATALOG) {
         m_contentType = (m_contentType == "movie") ? "series" : "movie";
         m_page = 0;
         loadCatalogData();

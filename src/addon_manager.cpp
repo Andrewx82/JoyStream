@@ -41,6 +41,19 @@ bool AddonManager::loadConfig(const std::string& path) {
         file >> j;
         m_addons.clear();
 
+        if (j.contains("filterMode") && j["filterMode"].is_number_integer()) {
+            m_filterConfig.mode = static_cast<StreamFilterMode>(j["filterMode"].get<int>());
+        }
+        if (j.contains("customExcludeRegex") && j["customExcludeRegex"].is_string()) {
+            m_filterConfig.customExcludeRegex = j["customExcludeRegex"].get<std::string>();
+        }
+        if (j.contains("customIncludeRegex") && j["customIncludeRegex"].is_string()) {
+            m_filterConfig.customIncludeRegex = j["customIncludeRegex"].get<std::string>();
+        }
+        if (j.contains("maxFileSizeGB") && j["maxFileSizeGB"].is_number()) {
+            m_filterConfig.maxFileSizeGB = j["maxFileSizeGB"].get<float>();
+        }
+
         if (j.contains("addons") && j["addons"].is_array()) {
             for (const auto& a : j["addons"]) {
                 std::string url = a.value("url", "");
@@ -74,6 +87,10 @@ bool AddonManager::saveConfig(const std::string& path) {
 #endif
 
     json j;
+    j["filterMode"] = static_cast<int>(m_filterConfig.mode);
+    j["customExcludeRegex"] = m_filterConfig.customExcludeRegex;
+    j["customIncludeRegex"] = m_filterConfig.customIncludeRegex;
+    j["maxFileSizeGB"] = m_filterConfig.maxFileSizeGB;
     j["addons"] = json::array();
 
     for (const auto& addon : m_addons) {

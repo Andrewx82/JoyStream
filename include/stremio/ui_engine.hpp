@@ -109,9 +109,14 @@ private:
     MetaItem m_selectedMeta;
     int m_detailsActionIndex = 0;
 
-    // Streams View
+    // Streams View & Filtering
+    std::vector<StreamItem> m_rawStreams;
     std::vector<StreamItem> m_availableStreams;
     int m_selectedStreamIndex = 0;
+    FilterConfig m_filterConfig;
+    void applyStreamFilter();
+    void cycleFilterMode();
+    void editCustomRegex();
 
     // Addons View
     int m_selectedAddonIndex = 0;

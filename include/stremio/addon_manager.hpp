@@ -1,6 +1,7 @@
 #pragma once
 
 #include "stremio/models.hpp"
+#include "stremio/stream_filter.hpp"
 #include <vector>
 #include <string>
 #include <optional>
@@ -17,7 +18,7 @@ class AddonManager {
 public:
     AddonManager();
 
-    // Load installed addons from disk (sdmc:/switch/stremio-nx/addons.json or local)
+    // Load installed addons from disk (sdmc:/switch/joystream/addons.json or local)
     bool loadConfig(const std::string& path = "");
 
     // Save installed addons to disk
@@ -31,6 +32,10 @@ public:
 
     // Toggle addon enabled state
     void setAddonEnabled(const std::string& id, bool enabled);
+
+    // Filter Config
+    const FilterConfig& getFilterConfig() const { return m_filterConfig; }
+    void setFilterConfig(const FilterConfig& config) { m_filterConfig = config; saveConfig(); }
 
     // Get all installed addons
     const std::vector<InstalledAddon>& getAddons() const { return m_addons; }
@@ -49,6 +54,7 @@ public:
 private:
     std::vector<InstalledAddon> m_addons;
     std::string m_configPath;
+    FilterConfig m_filterConfig;
 };
 
 } // namespace Stremio
