@@ -6,6 +6,7 @@
 #include <sstream>
 #include <cmath>
 #include <chrono>
+#include <algorithm>
 
 #ifdef __SWITCH__
 #include <switch.h>
@@ -94,6 +95,10 @@ bool UiEngine::initialize() {
         return false;
     }
 
+    // Set 5 cols x 2 rows
+    m_gridCols = 5;
+    m_gridRows = 2;
+
     // Load Fonts
 #ifdef __SWITCH__
     PlFontData sharedFont;
@@ -105,9 +110,9 @@ bool UiEngine::initialize() {
                   << " addr: " << sharedFont.address
                   << " size: " << std::dec << sharedFont.size << std::endl;
         if (R_SUCCEEDED(rcFont) && sharedFont.address && sharedFont.size > 0) {
-            m_fontSmall = TTF_OpenFontRW(SDL_RWFromMem(sharedFont.address, sharedFont.size), 0, 18);
-            m_fontMedium = TTF_OpenFontRW(SDL_RWFromMem(sharedFont.address, sharedFont.size), 0, 24);
-            m_fontLarge = TTF_OpenFontRW(SDL_RWFromMem(sharedFont.address, sharedFont.size), 0, 36);
+            m_fontSmall = TTF_OpenFontRW(SDL_RWFromMem(sharedFont.address, sharedFont.size), 0, 16);
+            m_fontMedium = TTF_OpenFontRW(SDL_RWFromMem(sharedFont.address, sharedFont.size), 0, 22);
+            m_fontLarge = TTF_OpenFontRW(SDL_RWFromMem(sharedFont.address, sharedFont.size), 0, 32);
         }
     }
 #else
@@ -117,10 +122,10 @@ bool UiEngine::initialize() {
         "/usr/share/fonts/TTF/DejaVuSans.ttf"
     };
     for (const char* p : fontPaths) {
-        m_fontSmall = TTF_OpenFont(p, 18);
+        m_fontSmall = TTF_OpenFont(p, 16);
         if (m_fontSmall) {
-            m_fontMedium = TTF_OpenFont(p, 24);
-            m_fontLarge = TTF_OpenFont(p, 36);
+            m_fontMedium = TTF_OpenFont(p, 22);
+            m_fontLarge = TTF_OpenFont(p, 32);
             break;
         }
     }
@@ -195,11 +200,10 @@ void UiEngine::posterDownloaderWorker() {
         }
 
         if (nextUrl.empty()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            std::this_thread::sleep_for(std::chrono::milliseconds(40));
             continue;
         }
 
-        // Fetch image bytes via HTTP
         std::map<std::string, std::string> emptyHeaders;
         HttpResponse resp = HttpClient::get(nextUrl, emptyHeaders, 8);
         if (resp.success && !resp.body.empty()) {
@@ -261,7 +265,6 @@ void UiEngine::loadCatalogData() {
         std::cerr << "[Catalog] Error loading catalog: " << e.what() << std::endl;
     }
 
-    // Queue visible page posters immediately
     int itemsPerPage = m_gridCols * m_gridRows;
     for (int i = 0; i < itemsPerPage && i < static_cast<int>(m_items.size()); ++i) {
         queuePosterDownload(m_items[i].poster);
@@ -287,7 +290,7 @@ void UiEngine::drawText(const std::string& text, int x, int y, SDL_Color color, 
 
     TTF_Font* font = m_fontMedium;
     if (fontSize <= 18) font = m_fontSmall;
-    else if (fontSize >= 32) font = m_fontLarge;
+    else if (fontSize >= 28) font = m_fontLarge;
 
     if (!font) return;
 
@@ -304,45 +307,95 @@ void UiEngine::drawText(const std::string& text, int x, int y, SDL_Color color, 
     SDL_FreeSurface(surface);
 }
 
+void UiEngine::drawCenteredText(const std::string& text, int x, int y, int w, int h, SDL_Color color, int fontSize) {
+    if (!m_renderer || text.empty()) return;
+
+    TTF_Font* font = m_fontMedium;
+    if (fontSize <= 18) font = m_fontSmall;
+    else if (fontSize >= 28) font = m_fontLarge;
+
+    if (!font) return;
+
+    SDL_Surface* surface = TTF_RenderUTF8_Blended(font, text.c_str(), color);
+    if (!surface) return;
+
+    SDL_Texture* texture = SDL_CreateTextureFromSurface(m_renderer, surface);
+    if (texture) {
+        int textX = x + (w - surface->w) / 2;
+        int textY = y + (h - surface->h) / 2;
+        SDL_Rect dst = {textX, textY, surface->w, surface->h};
+        SDL_RenderCopy(m_renderer, texture, nullptr, &dst);
+        SDL_DestroyTexture(texture);
+    }
+    SDL_FreeSurface(surface);
+}
+
+void UiEngine::drawTextureFitted(SDL_Texture* tex, int x, int y, int w, int h) {
+    if (!tex || !m_renderer) return;
+
+    int texW = 0, texH = 0;
+    if (SDL_QueryTexture(tex, nullptr, nullptr, &texW, &texH) < 0 || texW <= 0 || texH <= 0) {
+        return;
+    }
+
+    // Preserve natural aspect ratio
+    float scale = std::min(static_cast<float>(w) / texW, static_cast<float>(h) / texH);
+    int finalW = static_cast<int>(texW * scale);
+    int finalH = static_cast<int>(texH * scale);
+
+    int finalX = x + (w - finalW) / 2;
+    int finalY = y + (h - finalH) / 2;
+
+    SDL_Rect dst = {finalX, finalY, finalW, finalH};
+    SDL_RenderCopy(m_renderer, tex, nullptr, &dst);
+}
+
 void UiEngine::drawHeader() {
     // Header Bar
     drawRect(0, 0, 1280, 70, {18, 20, 29, 255});
     drawRect(0, 68, 1280, 2, {50, 54, 75, 255});
 
-    // Logo / Title
+    // Logo
     drawText("JOYSTREAM", 40, 18, {109, 93, 252, 255}, 32);
 
-    // Active Tab
-    std::string tab = (m_contentType == "movie") ? "[ Movies ]   Series" : "  Movies   [ Series ]";
-    drawText(tab, 300, 24, {220, 220, 240, 255}, 20);
+    // Clickable Tabs
+    bool isMovie = (m_contentType == "movie");
+    SDL_Color movieColor = isMovie ? SDL_Color{0, 212, 255, 255} : SDL_Color{140, 145, 170, 255};
+    SDL_Color seriesColor = !isMovie ? SDL_Color{0, 212, 255, 255} : SDL_Color{140, 145, 170, 255};
+
+    drawRect(290, 16, 120, 38, isMovie ? SDL_Color{35, 42, 65, 255} : SDL_Color{22, 25, 36, 255});
+    drawCenteredText("Movies", 290, 16, 120, 38, movieColor, 20);
+
+    drawRect(420, 16, 120, 38, !isMovie ? SDL_Color{35, 42, 65, 255} : SDL_Color{22, 25, 36, 255});
+    drawCenteredText("Series", 420, 16, 120, 38, seriesColor, 20);
 
     // Page indicator
     int itemsPerPage = m_gridCols * m_gridRows;
     int totalPages = std::max(1, static_cast<int>(std::ceil(static_cast<double>(m_items.size()) / itemsPerPage)));
-    std::string pageInfo = "Page " + std::to_string(m_page + 1) + " / " + std::to_string(totalPages);
-    drawText(pageInfo, 900, 24, {160, 165, 185, 255}, 18);
+    std::string pageInfo = "◀  Page " + std::to_string(m_page + 1) + " / " + std::to_string(totalPages) + "  ▶";
+    drawText(pageInfo, 820, 24, {180, 185, 205, 255}, 18);
 
-    // Addons Status
-    std::string addonInfo = std::to_string(m_addonManager.getAddons().size()) + " Addons Active";
-    drawText(addonInfo, 1240, 24, {140, 145, 170, 255}, 18, true);
+    // Addons Button
+    drawRect(1080, 16, 160, 38, {30, 35, 52, 255});
+    std::string addonInfo = std::to_string(m_addonManager.getAddons().size()) + " Addons (-)";
+    drawCenteredText(addonInfo, 1080, 16, 160, 38, {200, 205, 230, 255}, 18);
 }
 
 void UiEngine::drawFooter() {
-    // Footer Bar
     drawRect(0, 660, 1280, 60, {18, 20, 29, 255});
     drawRect(0, 660, 1280, 2, {50, 54, 75, 255});
 
     std::string hints;
     if (m_state == UiState::CATALOG) {
-        hints = "(D-Pad) Move   (A) Select   (L/R) Page   (X) Search   (Y) Type   (-) Addons   (+) Exit";
+        hints = "(Touch or D-Pad) Select   (A) Details   (L/R) Page   (X) Search   (Y) Type   (-) Addons";
     } else if (m_state == UiState::DETAILS) {
-        hints = "(A) Find Streams   (B) Back to Catalog";
+        hints = "(A / Touch) Watch Streams   (B) Back to Catalog";
     } else if (m_state == UiState::STREAMS) {
-        hints = "(D-Pad) Select Stream   (A) Play Stream   (B) Cancel";
+        hints = "(Touch or D-Pad) Select Stream   (A) Play   (B) Cancel";
     } else if (m_state == UiState::ADDONS) {
-        hints = "(D-Pad) Navigate   (A) Toggle   (X) Add New Addon   (B) Back";
+        hints = "(Touch or D-Pad) Toggle   (X) Add New Addon   (B) Back";
     } else if (m_state == UiState::PLAYER) {
-        hints = "(A) Play/Pause   (B) Stop   (D-Pad Left/Right) Seek 10s   (+) OSD";
+        hints = "(Touch / A) Play/Pause   (D-Pad Left/Right) Seek 10s   (Touch Bar) Scrub   (B) Stop";
     }
 
     drawText(hints, 40, 678, {160, 165, 185, 255}, 18);
@@ -357,16 +410,17 @@ void UiEngine::renderCatalog() {
 
     if (m_items.empty()) {
         drawText("No catalog items loaded.", 500, 300, {230, 100, 100, 255}, 24);
-        drawText("Check Wi-Fi connection, or press (-) to view Addons.", 410, 350, {180, 185, 205, 255}, 20);
+        drawText("Check Wi-Fi connection, or tap (-) to view Addons.", 410, 350, {180, 185, 205, 255}, 20);
         return;
     }
 
+    // 5 columns x 2 rows
     int startX = 40;
-    int startY = 95;
-    int cardW = 280;
-    int cardH = 260;
+    int startY = 85;
+    int cardW = 224;
+    int cardH = 265;
     int gapX = 20;
-    int gapY = 20;
+    int gapY = 15;
 
     int itemsPerPage = m_gridCols * m_gridRows;
     int startIndex = m_page * itemsPerPage;
@@ -384,7 +438,7 @@ void UiEngine::renderCatalog() {
         bool isSelected = (i == m_selectedGridIndex);
 
         // Card background
-        SDL_Color bg = isSelected ? SDL_Color{35, 40, 60, 255} : SDL_Color{24, 27, 38, 255};
+        SDL_Color bg = isSelected ? SDL_Color{35, 42, 65, 255} : SDL_Color{24, 27, 38, 255};
         drawRect(x, y, cardW, cardH, bg);
 
         // Selection Border
@@ -393,14 +447,21 @@ void UiEngine::renderCatalog() {
             drawRect(x - 1, y - 1, cardW + 2, cardH + 2, {0, 212, 255, 255}, false);
         }
 
-        // Render Poster
-        SDL_Rect posterDst = {x + 10, y + 10, cardW - 20, 150};
-        bool posterRendered = false;
+        // Poster box: 204w x 180h
+        int pBoxX = x + 10;
+        int pBoxY = y + 8;
+        int pBoxW = cardW - 20;
+        int pBoxH = 180;
 
+        // Poster backdrop box
+        drawRect(pBoxX, pBoxY, pBoxW, pBoxH, {16, 18, 25, 255});
+
+        bool posterRendered = false;
         if (!item.poster.empty()) {
             auto it = m_posterTextures.find(item.poster);
             if (it != m_posterTextures.end() && it->second) {
-                SDL_RenderCopy(m_renderer, it->second, nullptr, &posterDst);
+                // Aspect-ratio fitted rendering
+                drawTextureFitted(it->second, pBoxX, pBoxY, pBoxW, pBoxH);
                 posterRendered = true;
             } else {
                 queuePosterDownload(item.poster);
@@ -408,89 +469,106 @@ void UiEngine::renderCatalog() {
         }
 
         if (!posterRendered) {
-            drawRect(posterDst.x, posterDst.y, posterDst.w, posterDst.h, {15, 17, 24, 255});
-            std::string shortTitle = item.name.substr(0, 12);
-            drawText(shortTitle, x + cardW / 2, y + 70, {80, 85, 110, 255}, 18, true);
+            std::string shortTitle = item.name.substr(0, 14);
+            drawCenteredText(shortTitle, pBoxX, pBoxY, pBoxW, pBoxH, {80, 85, 110, 255}, 16);
         }
 
-        // Movie Title
+        // Movie Title (truncate cleanly)
         std::string title = item.name;
-        if (title.length() > 22) title = title.substr(0, 20) + "..";
-        drawText(title, x + 15, y + 172, {240, 240, 255, 255}, 20);
+        if (title.length() > 20) title = title.substr(0, 18) + "..";
+        drawText(title, x + 12, y + 196, {245, 245, 255, 255}, 18);
 
         // Year and IMDb Rating
         std::string metaStr = item.releaseInfo;
         if (!item.imdbRating.empty()) {
             metaStr += "  * " + item.imdbRating;
         }
-        drawText(metaStr, x + 15, y + 205, {230, 180, 50, 255}, 18);
+        drawText(metaStr, x + 12, y + 220, {230, 180, 50, 255}, 16);
 
         // Type Badge
-        drawText("[" + item.type + "]", x + 15, y + 230, {130, 135, 160, 255}, 14);
+        drawText("[" + item.type + "]", x + 12, y + 242, {130, 135, 160, 255}, 13);
     }
 }
 
 void UiEngine::renderDetails() {
+    // Backdrop Panel
     drawRect(40, 90, 1200, 550, {22, 25, 36, 255});
 
-    // Poster
-    SDL_Rect posterDst = {70, 120, 260, 390};
+    // Poster Box (260w x 390h)
+    int pBoxX = 70;
+    int pBoxY = 120;
+    int pBoxW = 260;
+    int pBoxH = 390;
+    drawRect(pBoxX, pBoxY, pBoxW, pBoxH, {15, 17, 24, 255});
+
     bool posterRendered = false;
     if (!m_selectedMeta.poster.empty()) {
         auto it = m_posterTextures.find(m_selectedMeta.poster);
         if (it != m_posterTextures.end() && it->second) {
-            SDL_RenderCopy(m_renderer, it->second, nullptr, &posterDst);
+            drawTextureFitted(it->second, pBoxX, pBoxY, pBoxW, pBoxH);
             posterRendered = true;
         } else {
             queuePosterDownload(m_selectedMeta.poster);
         }
     }
     if (!posterRendered) {
-        drawRect(posterDst.x, posterDst.y, posterDst.w, posterDst.h, {15, 17, 24, 255});
-        drawText("POSTER", 160, 300, {90, 95, 120, 255}, 20);
+        drawCenteredText("POSTER", pBoxX, pBoxY, pBoxW, pBoxH, {90, 95, 120, 255}, 20);
     }
 
     // Title & Info
-    drawText(m_selectedMeta.name, 360, 130, {255, 255, 255, 255}, 32);
+    drawText(m_selectedMeta.name, 360, 125, {255, 255, 255, 255}, 32);
 
     std::string sub = m_selectedMeta.releaseInfo + "  |  IMDb: " + (m_selectedMeta.imdbRating.empty() ? "N/A" : m_selectedMeta.imdbRating);
-    drawText(sub, 360, 180, {230, 180, 50, 255}, 20);
+    drawText(sub, 360, 175, {230, 180, 50, 255}, 20);
 
     // Genres
     std::string genreStr = "Genres: ";
     for (size_t i = 0; i < m_selectedMeta.genres.size(); ++i) {
         genreStr += m_selectedMeta.genres[i] + (i + 1 < m_selectedMeta.genres.size() ? ", " : "");
     }
-    drawText(genreStr, 360, 215, {160, 170, 200, 255}, 18);
+    drawText(genreStr, 360, 210, {160, 170, 200, 255}, 18);
 
     // Synopsis
-    drawText("Synopsis:", 360, 260, {200, 200, 220, 255}, 20);
+    drawText("Synopsis:", 360, 255, {200, 200, 220, 255}, 20);
     std::string desc = m_selectedMeta.description;
     size_t lineLen = 65;
     for (size_t i = 0; i < 4 && i * lineLen < desc.length(); ++i) {
         std::string chunk = desc.substr(i * lineLen, lineLen);
-        drawText(chunk, 360, 295 + static_cast<int>(i) * 26, {180, 185, 205, 255}, 18);
+        drawText(chunk, 360, 290 + static_cast<int>(i) * 26, {180, 185, 205, 255}, 18);
     }
 
     if (!m_selectedMeta.videos.empty()) {
         std::string epCount = "Episodes Available: " + std::to_string(m_selectedMeta.videos.size());
-        drawText(epCount, 360, 420, {0, 212, 255, 255}, 18);
+        drawText(epCount, 360, 415, {0, 212, 255, 255}, 18);
     }
 
-    // Action Button
+    // Action Button 1: "▶ WATCH NOW" (wide enough with generous padding)
+    int btnX = 360;
+    int btnY = 475;
+    int btnW = 280;
+    int btnH = 55;
+
     bool btnFocus = (m_detailsActionIndex == 0);
     SDL_Color btnBg = btnFocus ? SDL_Color{109, 93, 252, 255} : SDL_Color{50, 55, 75, 255};
-    drawRect(360, 470, 260, 55, btnBg);
+    drawRect(btnX, btnY, btnW, btnH, btnBg);
     if (btnFocus) {
-        drawRect(358, 468, 264, 59, {0, 212, 255, 255}, false);
+        drawRect(btnX - 2, btnY - 2, btnW + 4, btnH + 4, {0, 212, 255, 255}, false);
     }
-    drawText("▶  WATCH / STREAMS", 390, 484, {255, 255, 255, 255}, 20);
+    drawCenteredText("▶  WATCH NOW", btnX, btnY, btnW, btnH, {255, 255, 255, 255}, 22);
+
+    // Action Button 2: "BACK" (Touch/Clickable)
+    int backBtnX = 660;
+    int backBtnY = 475;
+    int backBtnW = 150;
+    int backBtnH = 55;
+    drawRect(backBtnX, backBtnY, backBtnW, backBtnH, {38, 42, 58, 255});
+    drawCenteredText("BACK", backBtnX, backBtnY, backBtnW, backBtnH, {200, 205, 225, 255}, 20);
 }
 
 void UiEngine::renderStreams() {
-    drawRect(0, 0, 1280, 720, {10, 10, 15, 200});
+    drawRect(0, 0, 1280, 720, {10, 10, 15, 210});
 
-    int mw = 840;
+    int mw = 860;
     int mh = 500;
     int mx = (1280 - mw) / 2;
     int my = (720 - mh) / 2;
@@ -498,6 +576,10 @@ void UiEngine::renderStreams() {
     drawRect(mx, my, mw, mh, {24, 27, 38, 255});
     drawRect(mx, my, mw, 50, {35, 40, 58, 255});
     drawText("AVAILABLE STREAMS (" + std::to_string(m_availableStreams.size()) + ")", mx + 30, my + 14, {255, 255, 255, 255}, 22);
+
+    // Close button (X) on top-right of modal
+    drawRect(mx + mw - 45, my + 10, 32, 32, {60, 65, 85, 255});
+    drawCenteredText("X", mx + mw - 45, my + 10, 32, 32, {255, 255, 255, 255}, 18);
 
     if (m_availableStreams.empty()) {
         drawText("No streams found from active addons.", mx + 50, my + 120, {200, 150, 150, 255}, 20);
@@ -527,7 +609,7 @@ void UiEngine::renderStreams() {
 
         std::string title = stream.title;
         std::replace(title.begin(), title.end(), '\n', ' ');
-        if (title.length() > 60) title = title.substr(0, 58) + "..";
+        if (title.length() > 65) title = title.substr(0, 63) + "..";
         drawText(title, mx + 40, y + 33, {200, 205, 220, 255}, 16);
     }
 }
@@ -535,7 +617,15 @@ void UiEngine::renderStreams() {
 void UiEngine::renderAddons() {
     drawRect(40, 90, 1200, 550, {22, 25, 36, 255});
     drawText("INSTALLED STREMIO ADDONS", 70, 115, {255, 255, 255, 255}, 28);
-    drawText("(Press X to add a custom addon URL, e.g. Torrentio / RealDebrid)", 70, 155, {160, 165, 185, 255}, 18);
+    drawText("(Tap or press X to add a custom addon URL, e.g. Torrentio / RealDebrid)", 70, 155, {160, 165, 185, 255}, 18);
+
+    // "+ Add Addon" touch button
+    int addBtnX = 960;
+    int addBtnY = 110;
+    int addBtnW = 220;
+    int addBtnH = 42;
+    drawRect(addBtnX, addBtnY, addBtnW, addBtnH, {109, 93, 252, 255});
+    drawCenteredText("+ ADD ADDON (X)", addBtnX, addBtnY, addBtnW, addBtnH, {255, 255, 255, 255}, 18);
 
     const auto& addons = m_addonManager.getAddons();
     int startY = 195;
@@ -565,9 +655,14 @@ void UiEngine::renderPlayer() {
     PlaybackState st = m_player.getState();
 
     if (m_showOsd) {
+        // Top banner with Back button
         drawRect(0, 0, 1280, 80, {10, 12, 18, 220});
-        drawText("▶  " + st.currentTitle, 40, 26, {255, 255, 255, 255}, 26);
+        drawRect(30, 20, 50, 40, {40, 45, 60, 255});
+        drawCenteredText("◀", 30, 20, 50, 40, {255, 255, 255, 255}, 22);
 
+        drawText(st.currentTitle, 100, 26, {255, 255, 255, 255}, 26);
+
+        // Bottom HUD
         drawRect(0, 600, 1280, 120, {10, 12, 18, 220});
 
         auto formatTime = [](double sec) {
@@ -587,16 +682,17 @@ void UiEngine::renderPlayer() {
             drawText("PAUSED", 1200, 620, {230, 180, 50, 255}, 20, true);
         }
 
+        // Timeline Scrubber
         int barX = 40;
         int barY = 655;
         int barW = 1200;
-        int barH = 10;
+        int barH = 12;
         drawRect(barX, barY, barW, barH, {60, 65, 80, 255});
 
         if (st.duration > 0.0) {
             int filledW = static_cast<int>((st.currentTime / st.duration) * barW);
             drawRect(barX, barY, filledW, barH, {109, 93, 252, 255});
-            drawRect(barX + filledW - 4, barY - 4, 8, 18, {0, 212, 255, 255});
+            drawRect(barX + filledW - 6, barY - 4, 12, 20, {0, 212, 255, 255});
         }
     }
 }
@@ -612,7 +708,6 @@ void UiEngine::openSearch() {
             m_page = 0;
             m_state = UiState::CATALOG;
 
-            // Pre-queue first page posters
             int itemsPerPage = m_gridCols * m_gridRows;
             for (int i = 0; i < itemsPerPage && i < static_cast<int>(m_items.size()); ++i) {
                 queuePosterDownload(m_items[i].poster);
@@ -641,6 +736,171 @@ void UiEngine::playStream(const StreamItem& stream) {
         }
         m_player.play(stream.url, m_selectedMeta.name + " (" + stream.name + ")");
         m_state = UiState::PLAYER;
+        m_lastPlayerInputTime = SDL_GetTicks();
+        m_showOsd = true;
+    }
+}
+
+// ----------------- Touchscreen Tap Handler -----------------
+
+void UiEngine::handleTouchTap(int x, int y) {
+    std::cout << "[Touch] Tap at (" << x << ", " << y << ") in state " << static_cast<int>(m_state) << std::endl;
+
+    // Header Taps (y: 0..70)
+    if (y < 70) {
+        if (x >= 290 && x <= 410) { // Movies tab
+            if (m_contentType != "movie") {
+                m_contentType = "movie";
+                m_page = 0;
+                loadCatalogData();
+                m_state = UiState::CATALOG;
+            }
+            return;
+        }
+        if (x >= 420 && x <= 540) { // Series tab
+            if (m_contentType != "series") {
+                m_contentType = "series";
+                m_page = 0;
+                loadCatalogData();
+                m_state = UiState::CATALOG;
+            }
+            return;
+        }
+        if (x >= 800 && x <= 950) { // Page indicator
+            if (x < 875) onPagePrev();
+            else onPageNext();
+            return;
+        }
+        if (x >= 1080 && x <= 1260) { // Addons button
+            onActionMenu();
+            return;
+        }
+    }
+
+    // State-specific touch handling
+    if (m_state == UiState::CATALOG) {
+        // Footer bar tap for Search
+        if (y >= 660) {
+            onActionSearch();
+            return;
+        }
+
+        // Check if a card was tapped
+        int startX = 40;
+        int startY = 85;
+        int cardW = 224;
+        int cardH = 265;
+        int gapX = 20;
+        int gapY = 15;
+
+        int itemsPerPage = m_gridCols * m_gridRows;
+        int maxItemsOnPage = std::min(itemsPerPage, static_cast<int>(m_items.size()) - m_page * itemsPerPage);
+
+        for (int i = 0; i < maxItemsOnPage; ++i) {
+            int col = i % m_gridCols;
+            int row = i / m_gridCols;
+            int cx = startX + col * (cardW + gapX);
+            int cy = startY + row * (cardH + gapY);
+
+            if (x >= cx && x <= cx + cardW && y >= cy && y <= cy + cardH) {
+                if (m_selectedGridIndex == i) {
+                    onActionConfirm(); // Second tap opens details!
+                } else {
+                    m_selectedGridIndex = i; // First tap highlights card
+                }
+                return;
+            }
+        }
+    } else if (m_state == UiState::DETAILS) {
+        // "WATCH NOW" button
+        if (x >= 360 && x <= 640 && y >= 475 && y <= 530) {
+            onActionConfirm();
+            return;
+        }
+        // "BACK" button
+        if (x >= 660 && x <= 810 && y >= 475 && y <= 530) {
+            onActionBack();
+            return;
+        }
+        // Tapping outside panel
+        if (x < 40 || x > 1240 || y < 90 || y > 640) {
+            onActionBack();
+            return;
+        }
+    } else if (m_state == UiState::STREAMS) {
+        int mw = 860;
+        int mh = 500;
+        int mx = (1280 - mw) / 2;
+        int my = (720 - mh) / 2;
+
+        // Close button (X)
+        if (x >= mx + mw - 50 && x <= mx + mw && y >= my && y <= my + 50) {
+            onActionBack();
+            return;
+        }
+
+        // Tapping a stream item
+        int startY = my + 65;
+        int itemH = 65;
+        for (size_t i = 0; i < 6 && i < m_availableStreams.size(); ++i) {
+            int itemY = startY + static_cast<int>(i) * itemH;
+            if (x >= mx + 20 && x <= mx + mw - 20 && y >= itemY && y <= itemY + itemH - 8) {
+                m_selectedStreamIndex = static_cast<int>(i);
+                playStream(m_availableStreams[i]);
+                return;
+            }
+        }
+
+        // Tapping outside modal closes it
+        if (x < mx || x > mx + mw || y < my || y > my + mh) {
+            onActionBack();
+            return;
+        }
+    } else if (m_state == UiState::ADDONS) {
+        // "+ ADD ADDON" button
+        if (x >= 960 && x <= 1180 && y >= 110 && y <= 155) {
+            openAddAddon();
+            return;
+        }
+
+        // Tapping an addon row to toggle
+        const auto& addons = m_addonManager.getAddons();
+        int startY = 195;
+        int itemH = 60;
+        for (size_t i = 0; i < addons.size(); ++i) {
+            int itemY = startY + static_cast<int>(i) * itemH;
+            if (x >= 70 && x <= 1210 && y >= itemY && y <= itemY + itemH - 10) {
+                m_selectedAddonIndex = static_cast<int>(i);
+                m_addonManager.setAddonEnabled(addons[i].url, !addons[i].enabled);
+                return;
+            }
+        }
+
+        // Footer or outside
+        if (y >= 660 || x < 40 || x > 1240) {
+            onActionBack();
+            return;
+        }
+    } else if (m_state == UiState::PLAYER) {
+        PlaybackState st = m_player.getState();
+
+        // Top-left Back button
+        if (x >= 20 && x <= 90 && y >= 15 && y <= 65) {
+            onActionBack();
+            return;
+        }
+
+        // Timeline scrubber tap (x: 40..1240, y: 640..680)
+        if (x >= 40 && x <= 1240 && y >= 640 && y <= 680 && st.duration > 0.0) {
+            float pct = std::clamp(static_cast<float>(x - 40) / 1200.0f, 0.0f, 1.0f);
+            m_player.seekAbsolute(pct * st.duration);
+            m_lastPlayerInputTime = SDL_GetTicks();
+            m_showOsd = true;
+            return;
+        }
+
+        // Tap screen toggles play/pause & shows HUD
+        m_player.togglePause();
         m_lastPlayerInputTime = SDL_GetTicks();
         m_showOsd = true;
     }
@@ -830,8 +1090,27 @@ void UiEngine::handleInput() {
             return;
         }
 
+        // Touch Screen input (Switch capacitive touch)
+        if (event.type == SDL_FINGERDOWN) {
+            uint32_t now = SDL_GetTicks();
+            if (now - m_lastTouchTime > 120) {
+                m_lastTouchTime = now;
+                int touchX = static_cast<int>(event.tfinger.x * 1280.0f);
+                int touchY = static_cast<int>(event.tfinger.y * 720.0f);
+                handleTouchTap(touchX, touchY);
+            }
+        }
+        else if (event.type == SDL_MOUSEBUTTONDOWN) {
+            if (event.button.button == SDL_BUTTON_LEFT) {
+                uint32_t now = SDL_GetTicks();
+                if (now - m_lastTouchTime > 120) {
+                    m_lastTouchTime = now;
+                    handleTouchTap(event.button.x, event.button.y);
+                }
+            }
+        }
         // Keyboard Navigation (Desktop & USB Keyboard)
-        if (event.type == SDL_KEYDOWN) {
+        else if (event.type == SDL_KEYDOWN) {
             switch (event.key.keysym.sym) {
                 case SDLK_LEFT:      onNavigateLeft(); break;
                 case SDLK_RIGHT:     onNavigateRight(); break;
@@ -884,7 +1163,7 @@ void UiEngine::handleInput() {
                     onNavigateDown(); break;
             }
         }
-        // D-Pad Hat Motion (Third-party & Pro controllers)
+        // D-Pad Hat Motion (Third-party controllers)
         else if (event.type == SDL_JOYHATMOTION) {
             if (event.jhat.value & SDL_HAT_LEFT)  onNavigateLeft();
             if (event.jhat.value & SDL_HAT_RIGHT) onNavigateRight();
@@ -894,8 +1173,8 @@ void UiEngine::handleInput() {
         // Analog Stick Axes Motion
         else if (event.type == SDL_JOYAXISMOTION) {
             uint32_t now = SDL_GetTicks();
-            if (now - m_lastStickNavTime > 220) { // 220ms debounce
-                if (event.jaxis.axis == 0) { // X Axis
+            if (now - m_lastStickNavTime > 220) {
+                if (event.jaxis.axis == 0) {
                     if (event.jaxis.value < -16000) {
                         onNavigateLeft();
                         m_lastStickNavTime = now;
@@ -903,7 +1182,7 @@ void UiEngine::handleInput() {
                         onNavigateRight();
                         m_lastStickNavTime = now;
                     }
-                } else if (event.jaxis.axis == 1) { // Y Axis
+                } else if (event.jaxis.axis == 1) {
                     if (event.jaxis.value < -16000) {
                         onNavigateUp();
                         m_lastStickNavTime = now;
@@ -918,7 +1197,6 @@ void UiEngine::handleInput() {
 }
 
 void UiEngine::update() {
-    // Process downloaded poster textures onto the GPU surface
     processDownloadedPosters();
 
     if (m_state == UiState::PLAYER && m_showOsd) {

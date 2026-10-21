@@ -61,9 +61,14 @@ private:
 
     // Render helpers
     void drawText(const std::string& text, int x, int y, SDL_Color color, int fontSize = 20, bool rightAlign = false);
+    void drawCenteredText(const std::string& text, int x, int y, int w, int h, SDL_Color color, int fontSize = 20);
+    void drawTextureFitted(SDL_Texture* tex, int x, int y, int w, int h);
     void drawRect(int x, int y, int w, int h, SDL_Color color, bool filled = true);
     void drawHeader();
     void drawFooter();
+
+    // Touch input handler
+    void handleTouchTap(int x, int y);
 
     // State renderers
     void renderCatalog();
@@ -115,8 +120,9 @@ private:
     uint32_t m_lastPlayerInputTime = 0;
     bool m_showOsd = true;
 
-    // Stick debounce
+    // Stick & touch debounce
     uint32_t m_lastStickNavTime = 0;
+    uint32_t m_lastTouchTime = 0;
 
     // Poster Textures & Async Downloader
     std::unordered_map<std::string, SDL_Texture*> m_posterTextures;
