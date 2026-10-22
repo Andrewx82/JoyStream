@@ -54,7 +54,20 @@ CurlStream::CurlStream(const std::string& url, const std::map<std::string, std::
 }
 
 CurlStream::~CurlStream() {
-    m_cancelled.store(true);
+    cancel();
+
+    // Stop prefetch worker thread
+    {
+        std::lock_guard<std::mutex> lock(m_prefetchMutex);
+        m_stopPrefetchThread = true;
+        m_pendingPrefetchOffset = -1;
+    }
+    m_prefetchCv.notify_all();
+
+    if (m_prefetchThread.joinable()) {
+        m_prefetchThread.join();
+    }
+
     if (m_curl) {
         curl_easy_cleanup(m_curl);
         m_curl = nullptr;
@@ -77,6 +90,7 @@ void CurlStream::setupCurlOptions(CURL* handle) {
     curl_easy_setopt(handle, CURLOPT_TCP_KEEPALIVE, 1L);
     curl_easy_setopt(handle, CURLOPT_TCP_KEEPIDLE, 30L);
     curl_easy_setopt(handle, CURLOPT_TCP_KEEPINTVL, 15L);
+    curl_easy_setopt(handle, CURLOPT_BUFFERSIZE, 256 * 1024L); // 256KB curl internal socket buffer
     if (m_headerList) {
         curl_easy_setopt(handle, CURLOPT_HTTPHEADER, m_headerList);
     }
@@ -93,8 +107,6 @@ bool CurlStream::open() {
     curl_easy_setopt(m_curl, CURLOPT_URL, m_originalUrl.c_str());
 
     // Probe initial 1-byte range (bytes=0-0)
-    // Using GET with Range allows resolving redirects, getting status code,
-    // and querying total file size from Content-Range in one lightweight call!
     curl_easy_setopt(m_curl, CURLOPT_RANGE, "0-0");
 
     HeaderContext hdrCtx;
@@ -154,9 +166,95 @@ bool CurlStream::open() {
     m_bufferLen = 0;
     m_currentPos = 0;
 
+    // Start background prefetch worker thread
+    m_prefetchThread = std::thread(&CurlStream::prefetchWorker, this);
+
     std::cout << "[CurlStream] Connected. Effective URL: " << m_effectiveUrl
               << " | Total Size: " << m_totalSize << " bytes | Seekable: " << (m_seekable ? "yes" : "no") << std::endl;
     return true;
+}
+
+void CurlStream::startPrefetch(int64_t offset) {
+    if (!m_seekable || m_cancelled.load() || (m_totalSize > 0 && offset >= m_totalSize)) return;
+
+    {
+        std::lock_guard<std::mutex> lock(m_prefetchMutex);
+        m_pendingPrefetchOffset = offset;
+    }
+    m_prefetchCv.notify_one();
+}
+
+void CurlStream::prefetchWorker() {
+    m_prefetchCurl = curl_easy_init();
+    if (!m_prefetchCurl) return;
+    setupCurlOptions(m_prefetchCurl);
+
+    while (true) {
+        int64_t offset = -1;
+        {
+            std::unique_lock<std::mutex> lock(m_prefetchMutex);
+            m_prefetchCv.wait(lock, [this]() {
+                return m_stopPrefetchThread || m_pendingPrefetchOffset >= 0;
+            });
+            if (m_stopPrefetchThread) break;
+            offset = m_pendingPrefetchOffset;
+            m_pendingPrefetchOffset = -1;
+        }
+
+        if (offset < 0 || m_cancelled.load() || (m_totalSize > 0 && offset >= m_totalSize)) {
+            continue;
+        }
+
+        size_t fetchSize = kChunkSize;
+        if (m_totalSize > 0 && offset + static_cast<int64_t>(fetchSize) > m_totalSize) {
+            fetchSize = static_cast<size_t>(m_totalSize - offset);
+        }
+        if (fetchSize == 0) continue;
+
+        int64_t endOffset = offset + static_cast<int64_t>(fetchSize) - 1;
+        std::string rangeStr = std::to_string(offset) + "-" + std::to_string(endOffset);
+
+        std::vector<uint8_t> tempBuf;
+        tempBuf.reserve(fetchSize);
+
+        curl_easy_setopt(m_prefetchCurl, CURLOPT_URL, m_effectiveUrl.c_str());
+        curl_easy_setopt(m_prefetchCurl, CURLOPT_RANGE, rangeStr.c_str());
+        curl_easy_setopt(m_prefetchCurl, CURLOPT_HEADERFUNCTION, nullptr);
+        curl_easy_setopt(m_prefetchCurl, CURLOPT_HEADERDATA, nullptr);
+
+        curl_easy_setopt(m_prefetchCurl, CURLOPT_WRITEFUNCTION, +[](void* ptr, size_t size, size_t nmemb, void* userp) -> size_t {
+            auto* self = static_cast<CurlStream*>(userp);
+            if (self->m_cancelled.load() || self->m_stopPrefetchThread) return 0; // Abort
+            size_t total = size * nmemb;
+            auto* b = static_cast<const uint8_t*>(ptr);
+            self->m_prefetchBuffer.insert(self->m_prefetchBuffer.end(), b, b + total);
+            return total;
+        });
+
+        {
+            std::lock_guard<std::mutex> lock(m_prefetchMutex);
+            m_prefetchReady = false;
+            m_prefetchBuffer.clear();
+            m_prefetchBuffer.reserve(fetchSize);
+        }
+
+        curl_easy_setopt(m_prefetchCurl, CURLOPT_WRITEDATA, this);
+        CURLcode res = curl_easy_perform(m_prefetchCurl);
+
+        if (res == CURLE_OK && !m_cancelled.load() && !m_stopPrefetchThread) {
+            std::lock_guard<std::mutex> lock(m_prefetchMutex);
+            if (!m_prefetchBuffer.empty()) {
+                m_prefetchStart = offset;
+                m_prefetchLen = m_prefetchBuffer.size();
+                m_prefetchReady = true;
+            }
+        }
+    }
+
+    if (m_prefetchCurl) {
+        curl_easy_cleanup(m_prefetchCurl);
+        m_prefetchCurl = nullptr;
+    }
 }
 
 bool CurlStream::fetchChunk(int64_t startOffset, size_t requestedBytes) {
@@ -211,10 +309,28 @@ int64_t CurlStream::read(char* buf, uint64_t nbytes) {
         return 0; // EOF
     }
 
-    // If currentPos is not within buffer range, fetch chunk
+    // If currentPos is not within active buffer range, check prefetch or fetch
     if (m_bufferStart < 0 || m_currentPos < m_bufferStart || m_currentPos >= m_bufferStart + static_cast<int64_t>(m_bufferLen)) {
-        if (!fetchChunk(m_currentPos, static_cast<size_t>(nbytes))) {
-            return 0; // EOF or error
+        bool usedPrefetch = false;
+        if (m_prefetchReady.load()) {
+            std::lock_guard<std::mutex> lock(m_prefetchMutex);
+            if (m_prefetchStart == m_currentPos && m_prefetchLen > 0) {
+                m_buffer = std::move(m_prefetchBuffer);
+                m_bufferStart = m_prefetchStart;
+                m_bufferLen = m_prefetchLen;
+                m_prefetchReady = false;
+                usedPrefetch = true;
+                // Kick off background prefetch for next chunk
+                startPrefetch(m_bufferStart + static_cast<int64_t>(m_bufferLen));
+            }
+        }
+
+        if (!usedPrefetch) {
+            if (!fetchChunk(m_currentPos, static_cast<size_t>(nbytes))) {
+                return 0; // EOF or error
+            }
+            // Kick off background prefetch for next chunk
+            startPrefetch(m_bufferStart + static_cast<int64_t>(m_bufferLen));
         }
     }
 
@@ -239,11 +355,22 @@ int64_t CurlStream::seek(int64_t offset) {
     }
 
     m_currentPos = offset;
+
+    // Invalidate prefetch if seeking far away
+    if (m_prefetchReady.load()) {
+        std::lock_guard<std::mutex> lock(m_prefetchMutex);
+        if (m_prefetchStart != m_currentPos) {
+            m_prefetchReady = false;
+            m_pendingPrefetchOffset = -1;
+        }
+    }
+
     return m_currentPos;
 }
 
 void CurlStream::cancel() {
     m_cancelled.store(true);
+    m_prefetchCv.notify_all();
 }
 
 int64_t CurlStream::mpvRead(void* cookie, char* buf, uint64_t nbytes) {

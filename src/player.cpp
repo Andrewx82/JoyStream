@@ -1,5 +1,6 @@
 #include "stremio/player.hpp"
 #include "stremio/curl_stream.hpp"
+#include "stremio/switch_sys.hpp"
 #include <iostream>
 #include <mpv/client.h>
 #include <mpv/render.h>
@@ -70,10 +71,21 @@ bool VideoPlayer::initialize() {
     // Video Output: Use libmpv rendering backend for mpv_render_context
     mpv_set_option_string(m_mpv, "vo", "libmpv");
 
-    // Software decoding: Required for MPV_RENDER_API_TYPE_SW software texture surface.
-    // Multi-threaded decoding on the 4 CPU cores provides fast and stable 720p/1080p playback.
+    // Software decoding optimizations:
+    // Multi-threaded decoding on all 4 CPU cores
     mpv_set_option_string(m_mpv, "hwdec", "no");
     mpv_set_option_string(m_mpv, "vd-lavc-threads", "4");
+    mpv_set_option_string(m_mpv, "vd-lavc-fast", "yes");
+    mpv_set_option_string(m_mpv, "vd-lavc-skiploopfilter", "nonref");
+    mpv_set_option_string(m_mpv, "vd-lavc-dr", "yes");
+
+    // Frame dropping and sync tuning for smooth playback
+    mpv_set_option_string(m_mpv, "framedrop", "vo");
+    mpv_set_option_string(m_mpv, "video-sync", "audio");
+
+    // Fast ARM NEON SIMD bilinear scaling in libswscale
+    mpv_set_option_string(m_mpv, "sws-scaler", "bilinear");
+    mpv_set_option_string(m_mpv, "sws-fast", "yes");
 
 #ifdef __SWITCH__
     mpv_set_option_string(m_mpv, "ao", "hos,sdl");
@@ -85,6 +97,7 @@ bool VideoPlayer::initialize() {
     mpv_set_option_string(m_mpv, "cache", "yes");
     mpv_set_option_string(m_mpv, "demuxer-max-bytes", "64M");
     mpv_set_option_string(m_mpv, "demuxer-max-back-bytes", "16M");
+    mpv_set_option_string(m_mpv, "demuxer-readahead-secs", "20");
     mpv_set_option_string(m_mpv, "network-timeout", "20");
     mpv_set_option_string(m_mpv, "ytdl", "no");
 
@@ -130,6 +143,7 @@ bool VideoPlayer::initialize() {
 }
 
 void VideoPlayer::shutdown() {
+    SwitchSys::restoreStock();
     if (m_mpvRenderCtx) {
         mpv_render_context_free(m_mpvRenderCtx);
         m_mpvRenderCtx = nullptr;
@@ -190,9 +204,11 @@ bool VideoPlayer::play(const std::string& url, const std::string& title, const s
     }
 
     std::cout << "[Playback] Dispatching to MPV: " << playUrl << std::endl;
+    SwitchSys::boostPlayback();
     const char* cmd[] = {"loadfile", playUrl.c_str(), "replace", nullptr};
     int res = mpv_command(m_mpv, cmd);
     if (res < 0) {
+        SwitchSys::restoreStock();
         m_state.errorMessage = mpv_error_string(res);
         std::cerr << "[Playback] Error issuing loadfile command: " << m_state.errorMessage << std::endl;
         return false;
@@ -223,6 +239,7 @@ void VideoPlayer::resume() {
 }
 
 void VideoPlayer::stop() {
+    SwitchSys::restoreStock();
     if (!m_mpv) return;
     const char* cmd[] = {"stop", nullptr};
     mpv_command(m_mpv, cmd);

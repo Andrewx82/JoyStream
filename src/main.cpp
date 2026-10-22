@@ -1,5 +1,6 @@
 #include "stremio/ui_engine.hpp"
 #include "stremio/http_client.hpp"
+#include "stremio/switch_sys.hpp"
 #include <iostream>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -29,7 +30,9 @@ int main(int argc, char* argv[]) {
     setupFileLogging();
 
 #ifdef __SWITCH__
+    svcSetThreadPriority(CUR_THREAD_HANDLE, 0x20);
     appletLockExit();
+    Stremio::SwitchSys::init();
 #endif
 
     std::cout << "[Init] Starting network subsystem..." << std::endl;
@@ -63,6 +66,7 @@ int main(int argc, char* argv[]) {
     }
 
 #ifdef __SWITCH__
+    Stremio::SwitchSys::restoreStock();
     appletUnlockExit();
 #endif
 

@@ -27,6 +27,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch" OR NINTENDO_SWITCH)
         src/addon_manager.cpp
         src/stream_filter.cpp
         src/curl_stream.cpp
+        src/switch_sys.cpp
         src/player.cpp
         src/ui_engine.cpp
     )
@@ -75,6 +76,7 @@ else()
         src/addon_manager.cpp
         src/stream_filter.cpp
         src/curl_stream.cpp
+        src/switch_sys.cpp
         src/player.cpp
         src/ui_engine.cpp
     )

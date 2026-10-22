@@ -1966,7 +1966,13 @@ void UiEngine::run() {
         handleInput();
         update();
         render();
-        SDL_Delay(16);
+        // When playing video, SDL_RenderPresent with VSYNC already syncs to the 60Hz display.
+        // Sleeping 16ms extra in player mode cuts the framerate to <=30 FPS and causes severe stutter.
+        if (m_state != UiState::PLAYER) {
+            SDL_Delay(16);
+        } else {
+            SDL_Delay(1);
+        }
     }
 }
 

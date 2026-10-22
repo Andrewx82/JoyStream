@@ -4,6 +4,9 @@
 #include <vector>
 #include <map>
 #include <atomic>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
 #include <cstdint>
 #include <curl/curl.h>
 
@@ -33,6 +36,8 @@ public:
 private:
     bool fetchChunk(int64_t startOffset, size_t requestedBytes);
     void setupCurlOptions(CURL* handle);
+    void startPrefetch(int64_t offset);
+    void prefetchWorker();
 
     std::string m_originalUrl;
     std::string m_effectiveUrl;
@@ -40,17 +45,31 @@ private:
     struct curl_slist* m_headerList = nullptr;
 
     CURL* m_curl = nullptr;
+    CURL* m_prefetchCurl = nullptr;
+
     int64_t m_currentPos = 0;
     int64_t m_totalSize = -1;
     bool m_seekable = true;
     std::atomic<bool> m_cancelled{false};
     std::string m_lastError;
 
-    // Buffer for chunked playback (1MB buffer)
-    static constexpr size_t kChunkSize = 1024 * 1024;
+    // Active buffer (4MB chunk size)
+    static constexpr size_t kChunkSize = 4 * 1024 * 1024;
     std::vector<uint8_t> m_buffer;
     int64_t m_bufferStart = -1;
     size_t m_bufferLen = 0;
+
+    // Background prefetch buffer (4MB)
+    std::vector<uint8_t> m_prefetchBuffer;
+    int64_t m_prefetchStart = -1;
+    size_t m_prefetchLen = 0;
+    std::atomic<bool> m_prefetchReady{false};
+
+    std::thread m_prefetchThread;
+    std::mutex m_prefetchMutex;
+    std::condition_variable m_prefetchCv;
+    int64_t m_pendingPrefetchOffset = -1;
+    bool m_stopPrefetchThread = false;
 };
 
 } // namespace Stremio
